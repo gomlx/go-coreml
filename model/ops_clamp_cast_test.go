@@ -107,9 +107,17 @@ func TestCast(t *testing.T) {
 	for _, op := range block.Operations {
 		if op.Type == "cast" {
 			foundCast = true
-			// Verify inputs
-			if len(op.Inputs) != 1 {
-				t.Errorf("cast should have 1 input, got %d", len(op.Inputs))
+			// Verify inputs: x (tensor) and dtype (string constant)
+			if len(op.Inputs) != 2 {
+				t.Errorf("cast should have 2 inputs (x and dtype), got %d", len(op.Inputs))
+			}
+			// Verify x input exists
+			if _, ok := op.Inputs["x"]; !ok {
+				t.Error("cast should have 'x' input")
+			}
+			// Verify dtype input exists
+			if _, ok := op.Inputs["dtype"]; !ok {
+				t.Error("cast should have 'dtype' input")
 			}
 			break
 		}

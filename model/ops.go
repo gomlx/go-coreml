@@ -1386,9 +1386,37 @@ func (b *Builder) Clip(x, minVal, maxVal *Value) *Value {
 // dtype: Target data type.
 // Output: x converted to dtype.
 func (b *Builder) Cast(x *Value, dtype DType) *Value {
+	// CoreML MIL cast operation requires dtype as a string parameter
+	dtypeStr := dtypeToString(dtype)
+	dtypeVal := b.Const(b.genName("dtype"), String, []int64{}, dtypeStr)
 	return b.addOp("cast", map[string]*Value{
-		"x": x,
+		"x":     x,
+		"dtype": dtypeVal,
 	}, b.genName("cast"), dtype, x.shape)
+}
+
+// dtypeToString converts a DType to its string representation for MIL operations.
+func dtypeToString(dtype DType) string {
+	switch dtype {
+	case Float32:
+		return "fp32"
+	case Float16:
+		return "fp16"
+	case Float64:
+		return "fp64"
+	case Int32:
+		return "int32"
+	case Int16:
+		return "int16"
+	case Int8:
+		return "int8"
+	case Int64:
+		return "int64"
+	case Bool:
+		return "bool"
+	default:
+		return "fp32"
+	}
 }
 
 // L2Norm computes L2 normalization along specified axes.
