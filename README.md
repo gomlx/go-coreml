@@ -9,7 +9,7 @@ go-coreml provides Go bindings to CoreML, enabling:
 - Running ML models on Apple's Neural Engine (ANE)
 - Metal GPU acceleration
 - Programmatic model construction using MIL (Machine Learning Intermediate Language)
-- Integration with [GoMLX](https://github.com/gomlx/gomlx) as a backend (planned)
+- Integration with [GoMLX](https://github.com/gomlx/gomlx) as a backend
 
 ## Status
 
@@ -19,15 +19,14 @@ go-coreml provides Go bindings to CoreML, enabling:
 
 - [x] Low-level bridge to CoreML (tensor creation, model loading, inference)
 - [x] Protobuf types generated from CoreML MIL.proto
-- [x] MIL program builder with common operations (add, mul, matmul, relu, etc.)
+- [x] MIL program builder with common operations (add, mul, matmul, conv2d, pooling, etc.)
 - [x] Model serialization to .mlpackage format
 - [x] Runtime for compiling and executing MIL programs
+- [x] GoMLX backend integration
+- [x] Weight blob support for large models
 
 ### Planned
 
-- [ ] GoMLX backend integration
-- [ ] More MIL operations (conv2d, pooling, etc.)
-- [ ] Weight blob support for large models
 - [ ] Performance benchmarks
 
 ## Requirements
@@ -87,13 +86,15 @@ func main() {
 
 The MIL builder supports these operations:
 
-- **Element-wise**: Add, Sub, Mul, Div, Neg, Abs
+- **Element-wise**: Add, Sub, Mul, Div, Neg, Abs, Pow, Min, Max
 - **Activations**: Relu, Sigmoid, Tanh, Softmax
-- **Math**: Exp, Log, Sqrt
-- **Linear Algebra**: MatMul
-- **Shape**: Reshape, Transpose
-- **Reductions**: ReduceSum, ReduceMean, ReduceMax
-- **Constants**: Const (for embedding literal values)
+- **Math**: Exp, Log, Sqrt, Sin, Cos, Erf
+- **Linear Algebra**: MatMul, Einsum
+- **Convolution**: Conv, ConvTranspose, MaxPool, AvgPool
+- **Shape**: Reshape, Transpose, Concat, Gather, Pad, Slice
+- **Reductions**: ReduceSum, ReduceMean, ReduceMax, ReduceMin, ReduceProduct, ArgMax, ArgMin
+- **Comparison**: Equal, NotEqual, LessThan, LessOrEqual, GreaterThan, GreaterOrEqual
+- **Other**: Where, Iota, Cast, Clamp
 
 ### Compute Unit Selection
 
@@ -115,28 +116,58 @@ rt := runtime.New(runtime.WithComputeUnits(bridge.ComputeCPUAndGPU))
 rt := runtime.New(runtime.WithComputeUnits(bridge.ComputeCPUAndANE))
 ```
 
+### Saving Models with Blob Storage
+
+For models with large weights (e.g., neural networks), use blob storage to keep weights in an external `weight.bin` file:
+
+```go
+import "github.com/gomlx/go-coreml/model"
+
+// Build your model
+b := model.NewBuilder("main")
+// ... add operations with large weight constants ...
+program := b.Build()
+
+// Convert to CoreML model
+inputs := []model.FeatureSpec{{Name: "x", DType: model.Float32, Shape: []int64{1, 512}}}
+outputs := []model.FeatureSpec{{Name: "y", DType: model.Float32, Shape: []int64{1, 10}}}
+opts := model.DefaultBlobOptions()
+coremlModel := model.ToModel(program, inputs, outputs, opts.SerializeOptions)
+
+// Save with blob storage (tensors > 1KB are stored externally)
+err := model.SaveMLPackageWithBlobs(coremlModel, "model.mlpackage", opts)
+```
+
+This creates the standard CoreML package structure with weights in `Data/com.apple.CoreML/weights/weight.bin`.
+
 ## Project Structure
 
 ```
 go-coreml/
-├── internal/
-│   └── bridge/          # Low-level cgo bindings to CoreML
-│       ├── bridge.h     # C-compatible function declarations
-│       ├── bridge.m     # Objective-C implementation
-│       └── bridge.go    # cgo wrapper
-├── model/
-│   ├── builder.go       # MIL program builder
-│   ├── ops.go           # MIL operation implementations
-│   └── serialize.go     # Model serialization
-├── runtime/
-│   └── runtime.go       # High-level compilation and execution
-├── proto/
-│   └── coreml/
-│       ├── milspec/     # Generated Go types from MIL.proto
-│       ├── spec/        # Generated Go types from Model.proto
-│       └── *.proto      # CoreML protobuf definitions
-└── specs/
-    └── 001-initial-plan.md  # Implementation plan
+|-- blob/                  # Weight blob storage
+|   |-- format.go          # Blob file format structs
+|   +-- writer.go          # Blob file writer
+|-- gomlx/                 # GoMLX backend implementation
+|   |-- backend.go         # Backend interface
+|   |-- function.go        # Operation implementations
+|   +-- executable.go      # Model execution
+|-- internal/
+|   +-- bridge/            # Low-level cgo bindings to CoreML
+|       |-- bridge.h       # C-compatible function declarations
+|       |-- bridge.m       # Objective-C implementation
+|       +-- bridge.go      # cgo wrapper
+|-- model/
+|   |-- builder.go         # MIL program builder
+|   |-- ops.go             # MIL operation implementations
+|   |-- serialize.go       # Model serialization
+|   +-- serialize_blob.go  # Blob-aware serialization
+|-- runtime/
+|   +-- runtime.go         # High-level compilation and execution
++-- proto/
+    +-- coreml/
+        |-- milspec/       # Generated Go types from MIL.proto
+        |-- spec/          # Generated Go types from Model.proto
+        +-- *.proto        # CoreML protobuf definitions
 ```
 
 ## Development

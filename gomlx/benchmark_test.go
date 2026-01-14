@@ -160,35 +160,7 @@ func BenchmarkMatMulExecution(b *testing.B) {
 	}
 }
 
-// BenchmarkConvolutionCompilation benchmarks 2D convolution compilation time.
-// SKIPPED: ConvGeneral is not implemented in CoreML backend.
-func BenchmarkConvolutionCompilation(b *testing.B) {
-	b.Skip("ConvGeneral not implemented in CoreML backend")
-}
 
-// BenchmarkConvolutionExecution benchmarks 2D convolution execution time.
-// SKIPPED: ConvGeneral is not implemented in CoreML backend.
-func BenchmarkConvolutionExecution(b *testing.B) {
-	b.Skip("ConvGeneral not implemented in CoreML backend")
-}
-
-// BenchmarkCNNPattern benchmarks a CNN-like pattern: Conv + ReLU + MaxPool.
-// SKIPPED: ConvGeneral and ReduceWindow are not implemented in CoreML backend.
-func BenchmarkCNNPattern(b *testing.B) {
-	b.Skip("ConvGeneral and ReduceWindow not implemented in CoreML backend")
-}
-
-// BenchmarkAttentionPattern benchmarks an attention-like pattern.
-// SKIPPED: DotGeneral is not implemented in CoreML backend.
-func BenchmarkAttentionPattern(b *testing.B) {
-	b.Skip("DotGeneral not implemented in CoreML backend")
-}
-
-// BenchmarkBatchedMatMul benchmarks batched matrix multiplication.
-// SKIPPED: DotGeneral is not implemented in CoreML backend.
-func BenchmarkBatchedMatMul(b *testing.B) {
-	b.Skip("DotGeneral not implemented in CoreML backend")
-}
 
 // BenchmarkUnaryOps benchmarks unary operations.
 func BenchmarkUnaryOps(b *testing.B) {
