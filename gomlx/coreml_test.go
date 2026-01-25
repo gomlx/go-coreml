@@ -1309,3 +1309,469 @@ func TestSortNotSupported(t *testing.T) {
 		t.Errorf("Error message should suggest argsort or topk as alternatives, got: %s", errMsg)
 	}
 }
+
+// TestIfConditional tests the If operation with a simple conditional.
+// Note: CoreML doesn't support boolean inputs, so we derive the predicate from a comparison.
+func TestIfConditional(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("test_if")
+	mainFn := builder.Main()
+
+	// Input: a threshold value and two tensors
+	// We'll compute pred = (threshold > 0) to get a boolean scalar
+	thresholdShape := shapes.Make(dtypes.Float32, 1)
+	threshold, err := mainFn.Parameter("threshold", thresholdShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter(threshold) failed: %v", err)
+	}
+
+	// Create a zero constant for comparison
+	zeroConst, err := mainFn.Constant([]float32{0.0})
+	if err != nil {
+		t.Fatalf("Constant(zero) failed: %v", err)
+	}
+
+	// Compute pred = threshold > 0 (gives a boolean scalar)
+	pred, err := mainFn.GreaterThan(threshold, zeroConst)
+	if err != nil {
+		t.Fatalf("GreaterThan() failed: %v", err)
+	}
+
+	// Convert the [1]-shaped boolean to scalar for If
+	predScalar, err := mainFn.Reshape(pred)
+	if err != nil {
+		t.Fatalf("Reshape(pred) failed: %v", err)
+	}
+
+	tensorShape := shapes.Make(dtypes.Float32, 4)
+	x, err := mainFn.Parameter("x", tensorShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter(x) failed: %v", err)
+	}
+
+	y, err := mainFn.Parameter("y", tensorShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter(y) failed: %v", err)
+	}
+
+	// Create the true branch: return x + y
+	trueBranch, err := mainFn.Closure()
+	if err != nil {
+		t.Fatalf("Closure() failed for trueBranch: %v", err)
+	}
+	sum, err := trueBranch.Add(x, y)
+	if err != nil {
+		t.Fatalf("Add() in trueBranch failed: %v", err)
+	}
+	err = trueBranch.Return([]backends.Value{sum}, nil)
+	if err != nil {
+		t.Fatalf("Return() in trueBranch failed: %v", err)
+	}
+
+	// Create the false branch: return x * y
+	falseBranch, err := mainFn.Closure()
+	if err != nil {
+		t.Fatalf("Closure() failed for falseBranch: %v", err)
+	}
+	prod, err := falseBranch.Mul(x, y)
+	if err != nil {
+		t.Fatalf("Mul() in falseBranch failed: %v", err)
+	}
+	err = falseBranch.Return([]backends.Value{prod}, nil)
+	if err != nil {
+		t.Fatalf("Return() in falseBranch failed: %v", err)
+	}
+
+	// If pred then x+y else x*y
+	results, err := mainFn.If(predScalar, trueBranch, falseBranch)
+	if err != nil {
+		t.Fatalf("If() failed: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("If() returned %d results, want 1", len(results))
+	}
+
+	err = mainFn.Return(results, nil)
+	if err != nil {
+		t.Fatalf("Return() failed: %v", err)
+	}
+
+	exec, err := builder.Compile()
+	if err != nil {
+		t.Fatalf("Compile() failed: %v", err)
+	}
+	defer exec.Finalize()
+
+	// Test with threshold=1 (pred=true)
+	t.Run("pred=true", func(t *testing.T) {
+		thresholdData := []float32{1.0}
+		xData := []float32{1.0, 2.0, 3.0, 4.0}
+		yData := []float32{10.0, 20.0, 30.0, 40.0}
+
+		thresholdBuf, err := backend.BufferFromFlatData(0, thresholdData, thresholdShape)
+		if err != nil {
+			t.Fatalf("BufferFromFlatData(threshold) failed: %v", err)
+		}
+		xBuf, err := backend.BufferFromFlatData(0, xData, tensorShape)
+		if err != nil {
+			t.Fatalf("BufferFromFlatData(x) failed: %v", err)
+		}
+		yBuf, err := backend.BufferFromFlatData(0, yData, tensorShape)
+		if err != nil {
+			t.Fatalf("BufferFromFlatData(y) failed: %v", err)
+		}
+
+		outputs, err := exec.Execute([]backends.Buffer{thresholdBuf, xBuf, yBuf}, nil, 0)
+		if err != nil {
+			t.Fatalf("Execute() failed: %v", err)
+		}
+
+		outputData := make([]float32, 4)
+		err = backend.BufferToFlatData(outputs[0], outputData)
+		if err != nil {
+			t.Fatalf("BufferToFlatData() failed: %v", err)
+		}
+
+		// When threshold > 0, pred=true, should return x+y = [11, 22, 33, 44]
+		expected := []float32{11.0, 22.0, 33.0, 44.0}
+		for i := range expected {
+			if math.Abs(float64(outputData[i]-expected[i])) > 1e-5 {
+				t.Errorf("outputData[%d] = %f, want %f", i, outputData[i], expected[i])
+			}
+		}
+	})
+
+	// Test with threshold=-1 (pred=false)
+	t.Run("pred=false", func(t *testing.T) {
+		thresholdData := []float32{-1.0}
+		xData := []float32{1.0, 2.0, 3.0, 4.0}
+		yData := []float32{10.0, 20.0, 30.0, 40.0}
+
+		thresholdBuf, err := backend.BufferFromFlatData(0, thresholdData, thresholdShape)
+		if err != nil {
+			t.Fatalf("BufferFromFlatData(threshold) failed: %v", err)
+		}
+		xBuf, err := backend.BufferFromFlatData(0, xData, tensorShape)
+		if err != nil {
+			t.Fatalf("BufferFromFlatData(x) failed: %v", err)
+		}
+		yBuf, err := backend.BufferFromFlatData(0, yData, tensorShape)
+		if err != nil {
+			t.Fatalf("BufferFromFlatData(y) failed: %v", err)
+		}
+
+		outputs, err := exec.Execute([]backends.Buffer{thresholdBuf, xBuf, yBuf}, nil, 0)
+		if err != nil {
+			t.Fatalf("Execute() failed: %v", err)
+		}
+
+		outputData := make([]float32, 4)
+		err = backend.BufferToFlatData(outputs[0], outputData)
+		if err != nil {
+			t.Fatalf("BufferToFlatData() failed: %v", err)
+		}
+
+		// When threshold <= 0, pred=false, should return x*y = [10, 40, 90, 160]
+		expected := []float32{10.0, 40.0, 90.0, 160.0}
+		for i := range expected {
+			if math.Abs(float64(outputData[i]-expected[i])) > 1e-5 {
+				t.Errorf("outputData[%d] = %f, want %f", i, outputData[i], expected[i])
+			}
+		}
+	})
+}
+
+// TestWhileLoop tests the While operation with a simple counting loop.
+// Note: CoreML doesn't support true scalar (0-dimensional) inputs, so we use shape [1].
+func TestWhileLoop(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("test_while")
+	mainFn := builder.Main()
+
+	// Input: max iteration count (shape [1] for CoreML compatibility)
+	inputShape := shapes.Make(dtypes.Int32, 1)
+	maxIterInput, err := mainFn.Parameter("max_iter", inputShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter(max_iter) failed: %v", err)
+	}
+	// Convert to scalar for internal use
+	scalarShape := shapes.Make(dtypes.Int32)
+	maxIter, err := mainFn.Reshape(maxIterInput)
+	if err != nil {
+		t.Fatalf("Reshape(max_iter) failed: %v", err)
+	}
+
+	// Initial loop variables: counter=0, sum=0 (as scalars)
+	zero, err := mainFn.Constant([]int32{0})
+	if err != nil {
+		t.Fatalf("Constant(zero) failed: %v", err)
+	}
+
+	// Create the condition function: counter < max_iter
+	condFn, err := mainFn.Closure()
+	if err != nil {
+		t.Fatalf("Closure() failed for condFn: %v", err)
+	}
+	// The condition function takes the loop variables as parameters
+	counter, err := condFn.Parameter("counter", scalarShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter(counter) in condFn failed: %v", err)
+	}
+	_, err = condFn.Parameter("sum", scalarShape, nil) // sum not used in condition
+	if err != nil {
+		t.Fatalf("Parameter(sum) in condFn failed: %v", err)
+	}
+	// counter < max_iter
+	cond, err := condFn.LessThan(counter, maxIter)
+	if err != nil {
+		t.Fatalf("LessThan() in condFn failed: %v", err)
+	}
+	err = condFn.Return([]backends.Value{cond}, nil)
+	if err != nil {
+		t.Fatalf("Return() in condFn failed: %v", err)
+	}
+
+	// Create the body function: counter++, sum += counter
+	bodyFn, err := mainFn.Closure()
+	if err != nil {
+		t.Fatalf("Closure() failed for bodyFn: %v", err)
+	}
+	bodyCounter, err := bodyFn.Parameter("counter", scalarShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter(counter) in bodyFn failed: %v", err)
+	}
+	bodySum, err := bodyFn.Parameter("sum", scalarShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter(sum) in bodyFn failed: %v", err)
+	}
+	one, err := bodyFn.Constant([]int32{1})
+	if err != nil {
+		t.Fatalf("Constant(one) in bodyFn failed: %v", err)
+	}
+	newCounter, err := bodyFn.Add(bodyCounter, one)
+	if err != nil {
+		t.Fatalf("Add(counter, one) in bodyFn failed: %v", err)
+	}
+	newSum, err := bodyFn.Add(bodySum, bodyCounter)
+	if err != nil {
+		t.Fatalf("Add(sum, counter) in bodyFn failed: %v", err)
+	}
+	err = bodyFn.Return([]backends.Value{newCounter, newSum}, nil)
+	if err != nil {
+		t.Fatalf("Return() in bodyFn failed: %v", err)
+	}
+
+	// While loop
+	results, err := mainFn.While(condFn, bodyFn, zero, zero)
+	if err != nil {
+		t.Fatalf("While() failed: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("While() returned %d results, want 2", len(results))
+	}
+
+	// Reshape outputs back to [1] for output
+	counterOut, err := mainFn.Reshape(results[0], 1)
+	if err != nil {
+		t.Fatalf("Reshape(counter) failed: %v", err)
+	}
+	sumOut, err := mainFn.Reshape(results[1], 1)
+	if err != nil {
+		t.Fatalf("Reshape(sum) failed: %v", err)
+	}
+
+	err = mainFn.Return([]backends.Value{counterOut, sumOut}, nil)
+	if err != nil {
+		t.Fatalf("Return() failed: %v", err)
+	}
+
+	exec, err := builder.Compile()
+	if err != nil {
+		t.Fatalf("Compile() failed: %v", err)
+	}
+	defer exec.Finalize()
+
+	// Test with max_iter=5
+	// Loop: sum = 0+1+2+3+4 = 10, counter = 5
+	maxIterData := []int32{5}
+	maxIterBuf, err := backend.BufferFromFlatData(0, maxIterData, inputShape)
+	if err != nil {
+		t.Fatalf("BufferFromFlatData(max_iter) failed: %v", err)
+	}
+
+	outputs, err := exec.Execute([]backends.Buffer{maxIterBuf}, nil, 0)
+	if err != nil {
+		t.Fatalf("Execute() failed: %v", err)
+	}
+
+	// Check counter output
+	counterData := make([]int32, 1)
+	err = backend.BufferToFlatData(outputs[0], counterData)
+	if err != nil {
+		t.Fatalf("BufferToFlatData(counter) failed: %v", err)
+	}
+	if counterData[0] != 5 {
+		t.Errorf("counter = %d, want 5", counterData[0])
+	}
+
+	// Check sum output
+	sumData := make([]int32, 1)
+	err = backend.BufferToFlatData(outputs[1], sumData)
+	if err != nil {
+		t.Fatalf("BufferToFlatData(sum) failed: %v", err)
+	}
+	// sum = 0+1+2+3+4 = 10
+	if sumData[0] != 10 {
+		t.Errorf("sum = %d, want 10", sumData[0])
+	}
+}
+
+// TestIfValidation tests that If properly validates its arguments.
+func TestIfValidation(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	t.Run("pred not bool", func(t *testing.T) {
+		builder := backend.Builder("test_if_validation")
+		mainFn := builder.Main()
+
+		// Non-bool predicate should fail
+		pred, _ := mainFn.Constant([]float32{1.0})
+		trueBranch, _ := mainFn.Closure()
+		x, _ := trueBranch.Constant([]float32{1.0})
+		trueBranch.Return([]backends.Value{x}, nil)
+		falseBranch, _ := mainFn.Closure()
+		y, _ := falseBranch.Constant([]float32{2.0})
+		falseBranch.Return([]backends.Value{y}, nil)
+
+		_, err := mainFn.If(pred, trueBranch, falseBranch)
+		if err == nil {
+			t.Error("If() should fail with non-bool predicate")
+		}
+	})
+
+	t.Run("pred not scalar", func(t *testing.T) {
+		builder := backend.Builder("test_if_validation2")
+		mainFn := builder.Main()
+
+		// Non-scalar predicate should fail
+		pred, _ := mainFn.Constant([]bool{true, false})
+		trueBranch, _ := mainFn.Closure()
+		x, _ := trueBranch.Constant([]float32{1.0})
+		trueBranch.Return([]backends.Value{x}, nil)
+		falseBranch, _ := mainFn.Closure()
+		y, _ := falseBranch.Constant([]float32{2.0})
+		falseBranch.Return([]backends.Value{y}, nil)
+
+		_, err := mainFn.If(pred, trueBranch, falseBranch)
+		if err == nil {
+			t.Error("If() should fail with non-scalar predicate")
+		}
+	})
+
+	t.Run("output count mismatch", func(t *testing.T) {
+		builder := backend.Builder("test_if_validation3")
+		mainFn := builder.Main()
+
+		pred, _ := mainFn.Constant([]bool{true})
+		trueBranch, _ := mainFn.Closure()
+		x1, _ := trueBranch.Constant([]float32{1.0})
+		x2, _ := trueBranch.Constant([]float32{2.0})
+		trueBranch.Return([]backends.Value{x1, x2}, nil) // 2 outputs
+		falseBranch, _ := mainFn.Closure()
+		y, _ := falseBranch.Constant([]float32{3.0})
+		falseBranch.Return([]backends.Value{y}, nil) // 1 output
+
+		_, err := mainFn.If(pred, trueBranch, falseBranch)
+		if err == nil {
+			t.Error("If() should fail with mismatched output counts")
+		}
+	})
+}
+
+// TestWhileValidation tests that While properly validates its arguments.
+func TestWhileValidation(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	t.Run("no initial state", func(t *testing.T) {
+		builder := backend.Builder("test_while_validation")
+		mainFn := builder.Main()
+
+		condFn, _ := mainFn.Closure()
+		cond, _ := condFn.Constant([]bool{true})
+		condFn.Return([]backends.Value{cond}, nil)
+
+		bodyFn, _ := mainFn.Closure()
+		bodyFn.Return([]backends.Value{}, nil)
+
+		_, err := mainFn.While(condFn, bodyFn) // no initial state
+		if err == nil {
+			t.Error("While() should fail with no initial state")
+		}
+	})
+
+	t.Run("cond returns non-bool", func(t *testing.T) {
+		builder := backend.Builder("test_while_validation2")
+		mainFn := builder.Main()
+
+		scalarShape := shapes.Make(dtypes.Int32)
+		initial, _ := mainFn.Constant([]int32{0})
+
+		condFn, _ := mainFn.Closure()
+		counter, _ := condFn.Parameter("counter", scalarShape, nil)
+		condFn.Return([]backends.Value{counter}, nil) // returns int, not bool
+
+		bodyFn, _ := mainFn.Closure()
+		c, _ := bodyFn.Parameter("counter", scalarShape, nil)
+		one, _ := bodyFn.Constant([]int32{1})
+		newC, _ := bodyFn.Add(c, one)
+		bodyFn.Return([]backends.Value{newC}, nil)
+
+		_, err := mainFn.While(condFn, bodyFn, initial)
+		if err == nil {
+			t.Error("While() should fail when cond returns non-bool")
+		}
+	})
+
+	t.Run("body output count mismatch", func(t *testing.T) {
+		builder := backend.Builder("test_while_validation3")
+		mainFn := builder.Main()
+
+		scalarShape := shapes.Make(dtypes.Int32)
+		initial1, _ := mainFn.Constant([]int32{0})
+		initial2, _ := mainFn.Constant([]int32{0})
+
+		condFn, _ := mainFn.Closure()
+		condFn.Parameter("a", scalarShape, nil)
+		condFn.Parameter("b", scalarShape, nil)
+		cond, _ := condFn.Constant([]bool{true})
+		condFn.Return([]backends.Value{cond}, nil)
+
+		bodyFn, _ := mainFn.Closure()
+		a, _ := bodyFn.Parameter("a", scalarShape, nil)
+		bodyFn.Parameter("b", scalarShape, nil)
+		bodyFn.Return([]backends.Value{a}, nil) // only 1 output, need 2
+
+		_, err := mainFn.While(condFn, bodyFn, initial1, initial2)
+		if err == nil {
+			t.Error("While() should fail when body outputs don't match initial state count")
+		}
+	})
+}

@@ -252,20 +252,32 @@ if batchGroupCount > 1 {
 
 **Workaround**: Restructure your model to avoid batch grouping, or use a different backend.
 
-#### Input Dilation
+#### Input Dilation (Base Dilation)
 
 ```go
 // NOT SUPPORTED: inputDilations > 1
-for _, d := range inputDilations {
+for i, d := range inputDilations {
     if d > 1 {
-        return nil, errors.Errorf("ConvGeneral: input dilations > 1 are not directly supported by CoreML backend")
+        return nil, errors.Errorf("ConvGeneral: input dilation ... is not supported by CoreML backend...")
     }
 }
 ```
 
-**Why**: CoreML Conv supports kernel dilation but not input dilation (also known as atrous/dilated inputs).
+**Why**: CoreML Conv supports **kernel dilation** but not **input dilation** (also known as "base dilation" or "atrous inputs").
 
-**Workaround**: Pre-pad/space your input tensor manually, or use a different backend.
+**Understanding the Difference**:
+- **Kernel Dilation** (SUPPORTED): Spaces out the kernel/filter weights. A 3x3 kernel with dilation=2 acts like a 5x5 kernel with zeros inserted between weights. CoreML supports this via the `dilations` parameter.
+- **Input Dilation** (NOT SUPPORTED): Inserts zeros between input elements before convolution. For example, input dilation=2 would double the input spatial dimensions by inserting zeros between each element.
+
+Input dilation is commonly used in:
+- Certain transposed convolution implementations
+- Sub-pixel convolution for upsampling
+- Some fractionally-strided convolution variants
+
+**Workarounds**:
+1. **Pre-process input manually**: Insert zeros into your input tensor before calling convolution. This can be done with reshape, concatenate with zeros, or scatter operations.
+2. **Use a different backend**: The XLA backend supports input dilation natively.
+3. **Restructure your model**: Consider alternative upsampling approaches like bilinear interpolation followed by regular convolution, or use `ConvTranspose` which handles upsampling internally.
 
 ### Pooling (ReduceWindow) Limitations
 

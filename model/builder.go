@@ -62,6 +62,11 @@ func (v *Value) DType() DType {
 	return v.dtype
 }
 
+// IsConst returns true if this value is a constant.
+func (v *Value) IsConst() bool {
+	return v.isConst
+}
+
 // Builder constructs MIL programs.
 type Builder struct {
 	name       string
@@ -120,6 +125,21 @@ func (b *Builder) Input(name string, dtype DType, shape ...int64) *Value {
 		builder: b,
 	}
 	b.inputs = append(b.inputs, v)
+	b.values[name] = v
+	return v
+}
+
+// PlaceholderValue creates a Value that is NOT added as a model input.
+// This is used for closure parameters which receive values via block inputs
+// in control flow operations, not from model inputs.
+func (b *Builder) PlaceholderValue(name string, dtype DType, shape ...int64) *Value {
+	v := &Value{
+		name:    name,
+		dtype:   dtype,
+		shape:   shape,
+		builder: b,
+	}
+	// Note: intentionally NOT added to b.inputs
 	b.values[name] = v
 	return v
 }

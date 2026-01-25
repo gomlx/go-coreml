@@ -543,6 +543,280 @@ func TestGatherNDPattern(t *testing.T) {
 	t.Logf("GatherND pattern test succeeded, output: %v", outputData)
 }
 
+// TestGatherSlicesWithSliceSize1 tests the GatherSlices pattern with slice_size=1
+// This extracts slices without collapsing the gathered dimension.
+// params[3, 5], indices[2, 1] -> output[2, 1, 5]
+func TestGatherSlicesWithSliceSize1(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("gather_slices_size1")
+	mainFn := builder.Main()
+
+	// Params shape: [3, 5] - like an embedding table with 3 embeddings of size 5
+	// Indices shape: [2, 1] - 2 indices, each pointing to one embedding (with indexVectorAxis=1)
+	paramsShape := shapes.Make(dtypes.Float32, 3, 5)
+	indicesShape := shapes.Make(dtypes.Int32, 2, 1)
+
+	params, err := mainFn.Parameter("params", paramsShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter() for params failed: %v", err)
+	}
+
+	indices, err := mainFn.Parameter("indices", indicesShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter() for indices failed: %v", err)
+	}
+
+	// GatherSlices pattern: no collapsed axes, slice_size=1 on the gathered axis
+	// This should produce output shape [2, 1, 5] (not [2, 5] like regular Gather)
+	// - indexVectorAxis: 1 (last axis of indices)
+	// - offsetOutputAxes: [1, 2] (all input axes map to output axes 1 and 2)
+	// - collapsedSliceAxes: [] (no collapsing - GatherSlices pattern)
+	// - startIndexMap: [0] (index into axis 0 of params)
+	// - sliceSizes: [1, 5] (take 1 element from axis 0, all 5 from axis 1)
+	result, err := mainFn.Gather(
+		params, indices,
+		1,          // indexVectorAxis
+		[]int{1, 2}, // offsetOutputAxes
+		[]int{},    // no collapsed axes - GatherSlices pattern
+		[]int{0},   // startIndexMap
+		[]int{1, 5}, // sliceSizes (slice_size=1 on gathered axis)
+		false,      // indicesAreSorted
+	)
+	if err != nil {
+		t.Fatalf("Gather() failed: %v", err)
+	}
+
+	if err := mainFn.Return([]backends.Value{result}, nil); err != nil {
+		t.Fatalf("Return() failed: %v", err)
+	}
+
+	exec, err := builder.Compile()
+	if err != nil {
+		t.Fatalf("Compile() failed: %v", err)
+	}
+	defer exec.Finalize()
+
+	// Test data
+	// Params: 3 embeddings, each of size 5
+	// Row 0: [0, 1, 2, 3, 4]
+	// Row 1: [10, 11, 12, 13, 14]
+	// Row 2: [20, 21, 22, 23, 24]
+	paramsData := []float32{
+		0, 1, 2, 3, 4,
+		10, 11, 12, 13, 14,
+		20, 21, 22, 23, 24,
+	}
+	// Indices: [1, 2] - get embeddings 1 and 2
+	indicesData := []int32{1, 2}
+
+	paramsBuf, err := backend.BufferFromFlatData(0, paramsData, paramsShape)
+	if err != nil {
+		t.Fatalf("BufferFromFlatData() for params failed: %v", err)
+	}
+	defer backend.BufferFinalize(paramsBuf)
+
+	indicesBuf, err := backend.BufferFromFlatData(0, indicesData, indicesShape)
+	if err != nil {
+		t.Fatalf("BufferFromFlatData() for indices failed: %v", err)
+	}
+	defer backend.BufferFinalize(indicesBuf)
+
+	outputs, err := exec.Execute([]backends.Buffer{paramsBuf, indicesBuf}, nil, 0)
+	if err != nil {
+		t.Fatalf("Execute() failed: %v", err)
+	}
+
+	if len(outputs) != 1 {
+		t.Fatalf("Expected 1 output, got %d", len(outputs))
+	}
+
+	// Expected output shape: [2, 1, 5]
+	// Row 0: [[10, 11, 12, 13, 14]] (embedding 1, with extra dimension)
+	// Row 1: [[20, 21, 22, 23, 24]] (embedding 2, with extra dimension)
+	outputData := make([]float32, 2*1*5)
+	if err := backend.BufferToFlatData(outputs[0], outputData); err != nil {
+		t.Fatalf("BufferToFlatData() failed: %v", err)
+	}
+
+	expected := []float32{10, 11, 12, 13, 14, 20, 21, 22, 23, 24}
+	for i, exp := range expected {
+		if math.Abs(float64(outputData[i]-exp)) > 1e-5 {
+			t.Errorf("outputData[%d] = %f, want %f", i, outputData[i], exp)
+		}
+	}
+	t.Logf("GatherSlices (slice_size=1) output: %v", outputData)
+}
+
+// TestGatherSlicesNonZeroAxis tests GatherSlices on a non-zero axis with slice_size=1
+// params[2, 4, 3], indices[2, 1] -> output[2, 2, 1, 3]
+func TestGatherSlicesNonZeroAxis(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("gather_slices_nonzero_axis")
+	mainFn := builder.Main()
+
+	// Params shape: [2, 4, 3] - 2 batches, 4 items per batch, 3 features per item
+	// Indices shape: [2, 1] - 2 indices to gather from axis 1
+	paramsShape := shapes.Make(dtypes.Float32, 2, 4, 3)
+	indicesShape := shapes.Make(dtypes.Int32, 2, 1)
+
+	params, err := mainFn.Parameter("params", paramsShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter() for params failed: %v", err)
+	}
+
+	indices, err := mainFn.Parameter("indices", indicesShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter() for indices failed: %v", err)
+	}
+
+	// GatherSlices along axis 1 (middle axis) with no collapse
+	// Output shape: [2, 2, 1, 3]
+	// - indexVectorAxis: 1 (last axis of indices)
+	// - offsetOutputAxes: [1, 2, 3] (all input axes map to output axes 1, 2, 3)
+	// - collapsedSliceAxes: [] (no collapsing)
+	// - startIndexMap: [1] (index into axis 1)
+	// - sliceSizes: [2, 1, 3] (full on axis 0, slice_size=1 on axis 1, full on axis 2)
+	result, err := mainFn.Gather(
+		params, indices,
+		1,              // indexVectorAxis
+		[]int{1, 2, 3}, // offsetOutputAxes
+		[]int{},        // no collapsed axes
+		[]int{1},       // startIndexMap (index into axis 1)
+		[]int{2, 1, 3}, // sliceSizes
+		false,          // indicesAreSorted
+	)
+	if err != nil {
+		t.Fatalf("Gather() failed: %v", err)
+	}
+
+	if err := mainFn.Return([]backends.Value{result}, nil); err != nil {
+		t.Fatalf("Return() failed: %v", err)
+	}
+
+	exec, err := builder.Compile()
+	if err != nil {
+		t.Fatalf("Compile() failed: %v", err)
+	}
+	defer exec.Finalize()
+
+	// Test data
+	// Batch 0: 4 items with 3 features each
+	// Batch 1: 4 items with 3 features each
+	paramsData := []float32{
+		// Batch 0
+		0, 1, 2, // item 0
+		3, 4, 5, // item 1
+		6, 7, 8, // item 2
+		9, 10, 11, // item 3
+		// Batch 1
+		100, 101, 102, // item 0
+		103, 104, 105, // item 1
+		106, 107, 108, // item 2
+		109, 110, 111, // item 3
+	}
+	// Indices: get items 1 and 3
+	indicesData := []int32{1, 3}
+
+	paramsBuf, err := backend.BufferFromFlatData(0, paramsData, paramsShape)
+	if err != nil {
+		t.Fatalf("BufferFromFlatData() for params failed: %v", err)
+	}
+	defer backend.BufferFinalize(paramsBuf)
+
+	indicesBuf, err := backend.BufferFromFlatData(0, indicesData, indicesShape)
+	if err != nil {
+		t.Fatalf("BufferFromFlatData() for indices failed: %v", err)
+	}
+	defer backend.BufferFinalize(indicesBuf)
+
+	outputs, err := exec.Execute([]backends.Buffer{paramsBuf, indicesBuf}, nil, 0)
+	if err != nil {
+		t.Fatalf("Execute() failed: %v", err)
+	}
+
+	// Expected output shape: [2, 2, 1, 3]
+	// Gathered items 1 and 3 from each batch, keeping the size-1 dimension
+	outputData := make([]float32, 2*2*1*3)
+	if err := backend.BufferToFlatData(outputs[0], outputData); err != nil {
+		t.Fatalf("BufferToFlatData() failed: %v", err)
+	}
+
+	// Expected (flattened):
+	// Output shape is [2, 2, 1, 3] (batch_from_indices=2, batch_from_params=2, gathered_axis=1, features=3)
+	// The order is: for each batch_from_params, for each index, the slice with size 1
+	// batch 0: index 0 (item 1) [3,4,5], index 1 (item 3) [9,10,11]
+	// batch 1: index 0 (item 1) [103,104,105], index 1 (item 3) [109,110,111]
+	expected := []float32{
+		3, 4, 5,
+		9, 10, 11,
+		103, 104, 105,
+		109, 110, 111,
+	}
+	for i, exp := range expected {
+		if math.Abs(float64(outputData[i]-exp)) > 1e-5 {
+			t.Errorf("outputData[%d] = %f, want %f", i, outputData[i], exp)
+		}
+	}
+	t.Logf("GatherSlices on non-zero axis succeeded, output: %v", outputData)
+}
+
+// TestGatherSlicesWithSliceSizeGreaterThan1 tests that GatherSlices with slice_size > 1
+// returns an appropriate error (not yet supported)
+func TestGatherSlicesWithSliceSizeGreaterThan1(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("gather_slices_size_gt_1")
+	mainFn := builder.Main()
+
+	paramsShape := shapes.Make(dtypes.Float32, 4, 3, 2)
+	indicesShape := shapes.Make(dtypes.Int32, 2, 1)
+
+	params, err := mainFn.Parameter("params", paramsShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter() for params failed: %v", err)
+	}
+
+	indices, err := mainFn.Parameter("indices", indicesShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter() for indices failed: %v", err)
+	}
+
+	// Try a GatherSlices pattern with slice_size=2 (> 1) - should fail
+	_, err = mainFn.Gather(
+		params, indices,
+		1,              // indexVectorAxis
+		[]int{1, 2, 3}, // offsetOutputAxes
+		[]int{},        // no collapsed axes - GatherSlices pattern
+		[]int{0},       // startIndexMap
+		[]int{2, 3, 2}, // sliceSizes (slice_size=2 on axis 0, which is > 1)
+		false,          // indicesAreSorted
+	)
+	if err == nil {
+		t.Fatalf("Expected error for GatherSlices with slice_size > 1, but got nil")
+	}
+
+	// Verify error message is helpful
+	errMsg := err.Error()
+	if !contains(errMsg, "slice_size > 1") && !contains(errMsg, "GatherSlices") {
+		t.Errorf("Error message should mention slice_size > 1 or GatherSlices, got: %s", errMsg)
+	}
+	t.Logf("Got expected error for slice_size > 1: %v", err)
+}
+
 // TestGatherUnsupportedPatternError tests that unsupported gather patterns
 // return appropriate error messages
 func TestGatherUnsupportedPatternError(t *testing.T) {

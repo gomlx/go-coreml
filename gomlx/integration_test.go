@@ -4,6 +4,7 @@ package coreml
 
 import (
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/gomlx/gomlx/backends"
@@ -807,4 +808,194 @@ func TestReduceWindowMinPoolNegativeValues(t *testing.T) {
 			t.Errorf("Expected output[%d] = %f, got %f", i, v, outputData[i])
 		}
 	}
+}
+
+// TestConvGeneralInputDilationError tests that ConvGeneral returns a helpful error
+// when input dilation > 1 is requested (which CoreML doesn't support).
+func TestConvGeneralInputDilationError(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("conv_input_dilation_error")
+	mainFn := builder.Main()
+
+	// Input shape: [1, 1, 4, 4] (batch=1, channels=1, height=4, width=4)
+	inputShape := shapes.Make(dtypes.Float32, 1, 1, 4, 4)
+	// Kernel shape: [1, 1, 2, 2] (out_channels=1, in_channels=1, kH=2, kW=2)
+	kernelShape := shapes.Make(dtypes.Float32, 1, 1, 2, 2)
+
+	input, err := mainFn.Parameter("input", inputShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter() for input failed: %v", err)
+	}
+
+	kernel, err := mainFn.Parameter("kernel", kernelShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter() for kernel failed: %v", err)
+	}
+
+	// NCHW layout
+	axesConfig := backends.ConvolveAxesConfig{
+		InputBatch:           0,
+		InputChannels:        1,
+		InputSpatial:         []int{2, 3},
+		KernelInputChannels:  1,
+		KernelOutputChannels: 0,
+		KernelSpatial:        []int{2, 3},
+		OutputBatch:          0,
+		OutputChannels:       1,
+		OutputSpatial:        []int{2, 3},
+	}
+
+	// Try to use input dilation > 1 (should fail with helpful error)
+	_, err = mainFn.ConvGeneral(
+		input, kernel, axesConfig,
+		[]int{1, 1}, // strides
+		nil,         // paddings (valid)
+		[]int{2, 2}, // inputDilations > 1 - NOT SUPPORTED
+		nil,         // kernelDilations
+		1,           // channelGroupCount
+		1,           // batchGroupCount
+	)
+
+	// Verify we get an error
+	if err == nil {
+		t.Fatal("ConvGeneral with inputDilations > 1 should have failed, but it didn't")
+	}
+
+	// Verify the error message is helpful
+	errMsg := err.Error()
+
+	// Check that the error mentions key concepts
+	if !strings.Contains(errMsg, "input dilation") {
+		t.Errorf("Error message should mention 'input dilation', got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "base dilation") {
+		t.Errorf("Error message should mention 'base dilation' (alternative name), got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "CoreML") {
+		t.Errorf("Error message should mention 'CoreML', got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "kernel dilation") && !strings.Contains(errMsg, "KERNEL dilation") {
+		t.Errorf("Error message should explain that KERNEL dilation IS supported, got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "orkaround") { // Workaround or workarounds
+		t.Errorf("Error message should suggest workarounds, got: %s", errMsg)
+	}
+
+	t.Logf("Got expected helpful error message: %s", errMsg)
+}
+
+// TestConvGeneralKernelDilationWorks tests that kernel dilation (which IS supported) works correctly.
+func TestConvGeneralKernelDilationWorks(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("conv_kernel_dilation")
+	mainFn := builder.Main()
+
+	// Input shape: [1, 1, 5, 5] (batch=1, channels=1, height=5, width=5)
+	inputShape := shapes.Make(dtypes.Float32, 1, 1, 5, 5)
+	// Kernel shape: [1, 1, 2, 2] (out_channels=1, in_channels=1, kH=2, kW=2)
+	kernelShape := shapes.Make(dtypes.Float32, 1, 1, 2, 2)
+
+	input, err := mainFn.Parameter("input", inputShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter() for input failed: %v", err)
+	}
+
+	kernel, err := mainFn.Parameter("kernel", kernelShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter() for kernel failed: %v", err)
+	}
+
+	// NCHW layout
+	axesConfig := backends.ConvolveAxesConfig{
+		InputBatch:           0,
+		InputChannels:        1,
+		InputSpatial:         []int{2, 3},
+		KernelInputChannels:  1,
+		KernelOutputChannels: 0,
+		KernelSpatial:        []int{2, 3},
+		OutputBatch:          0,
+		OutputChannels:       1,
+		OutputSpatial:        []int{2, 3},
+	}
+
+	// Use kernel dilation = 2 (which IS supported by CoreML)
+	// A 2x2 kernel with dilation 2 acts like a 3x3 kernel with center cross pattern
+	convResult, err := mainFn.ConvGeneral(
+		input, kernel, axesConfig,
+		[]int{1, 1}, // strides
+		nil,         // paddings (valid)
+		nil,         // inputDilations (not used)
+		[]int{2, 2}, // kernelDilations = 2 - SUPPORTED
+		1,           // channelGroupCount
+		1,           // batchGroupCount
+	)
+	if err != nil {
+		t.Fatalf("ConvGeneral with kernelDilations should work, but got error: %v", err)
+	}
+
+	// Set output
+	if err := mainFn.Return([]backends.Value{convResult}, nil); err != nil {
+		t.Fatalf("Return() failed: %v", err)
+	}
+
+	// Compile
+	exec, err := builder.Compile()
+	if err != nil {
+		t.Fatalf("Compile() failed: %v", err)
+	}
+	defer exec.Finalize()
+
+	// Create input buffers - all ones for simplicity
+	inputData := make([]float32, 25)
+	for i := range inputData {
+		inputData[i] = 1.0
+	}
+	// Kernel: identity-like diagonal kernel
+	kernelData := []float32{1, 0, 0, 1}
+
+	inputBuffer, err := backend.BufferFromFlatData(0, inputData, inputShape)
+	if err != nil {
+		t.Fatalf("BufferFromFlatData() for input failed: %v", err)
+	}
+	kernelBuffer, err := backend.BufferFromFlatData(0, kernelData, kernelShape)
+	if err != nil {
+		t.Fatalf("BufferFromFlatData() for kernel failed: %v", err)
+	}
+
+	// Execute
+	outputs, err := exec.Execute([]backends.Buffer{inputBuffer, kernelBuffer}, nil, 0)
+	if err != nil {
+		t.Fatalf("Execute() failed: %v", err)
+	}
+	if len(outputs) != 1 {
+		t.Fatalf("Expected 1 output, got %d", len(outputs))
+	}
+
+	// With 5x5 input, 2x2 kernel with dilation 2 (effective 3x3), valid padding:
+	// Output should be 3x3
+	// Each output element is sum of 4 input elements at dilated positions
+	// With all 1s input and kernel [1,0;0,1], output should be 2.0 everywhere
+	expectedShape := shapes.Make(dtypes.Float32, 1, 1, 3, 3)
+	outputData := make([]float32, expectedShape.Size())
+	if err := backend.BufferToFlatData(outputs[0], outputData); err != nil {
+		t.Fatalf("BufferToFlatData() failed: %v", err)
+	}
+
+	// Verify output values are correct (should be 2.0 = 1*1 + 0 + 0 + 1*1)
+	for i, v := range outputData {
+		if math.Abs(float64(v-2.0)) > 0.01 {
+			t.Errorf("Expected output[%d] = 2.0, got %f", i, v)
+		}
+	}
+	t.Logf("Kernel dilation works correctly, output: %v", outputData)
 }

@@ -116,18 +116,34 @@ func (f *Function) Parameter(name string, shape shapes.Shape, sharding *backends
 		dims[i] = int64(shape.Dimensions[i])
 	}
 
-	// Create input in MIL builder
-	milValue := f.builder.milBuilder.Input(name, milDType, dims...)
+	var milValue *model.Value
+	var node *Node
 
-	// Create node
-	node := f.builder.newNode(backends.OpTypeParameter, shape, milValue)
-	f.builder.inputs = append(f.builder.inputs, node)
-	f.builder.nodeMap[node] = milValue
-	f.parameters = append(f.parameters, node) // Track in function for closures
-
-	// Track input metadata
-	f.builder.inputNames = append(f.builder.inputNames, name)
-	f.builder.inputShapes = append(f.builder.inputShapes, shape)
+	// Check if this is a closure (has a parent function)
+	// Closure parameters are not model inputs - they receive values from the parent scope
+	// via control flow operations (While, If) at runtime
+	if f.parent != nil {
+		// For closures, create a placeholder value that is NOT added as a model input.
+		// The actual block input will be created during replayClosureInBlock.
+		// We use a unique name to avoid conflicts.
+		closureParamName := fmt.Sprintf("closure_%p_param_%s", f, name)
+		milValue = f.builder.milBuilder.PlaceholderValue(closureParamName, milDType, dims...)
+		node = f.builder.newNode(backends.OpTypeParameter, shape, milValue)
+		f.builder.nodeMap[node] = milValue
+		f.parameters = append(f.parameters, node)
+		// Note: We do NOT append to f.builder.inputs, inputNames, or inputShapes
+		// because closure parameters are not model-level inputs
+	} else {
+		// For the main function, create a proper model input
+		milValue = f.builder.milBuilder.Input(name, milDType, dims...)
+		node = f.builder.newNode(backends.OpTypeParameter, shape, milValue)
+		f.builder.inputs = append(f.builder.inputs, node)
+		f.builder.nodeMap[node] = milValue
+		f.parameters = append(f.parameters, node)
+		// Track input metadata for model-level inputs only
+		f.builder.inputNames = append(f.builder.inputNames, name)
+		f.builder.inputShapes = append(f.builder.inputShapes, shape)
+	}
 
 	return node, nil
 }
@@ -305,6 +321,13 @@ type CompiledClosure struct {
 // Operations on Function
 //======================================================================================================================
 
+// isClosureContext returns true if this function is a closure (has a parent function).
+// Closures don't build MIL operations eagerly; instead, operations are built during replay
+// in the control flow BlockBuilder.
+func (f *Function) isClosureContext() bool {
+	return f.parent != nil
+}
+
 // addUnaryOp is a helper that adds a unary operation to the computation graph.
 func (f *Function) addUnaryOp(
 	opType backends.OpType,
@@ -323,11 +346,17 @@ func (f *Function) addUnaryOp(
 		return nil, err
 	}
 
-	// Get the MIL Value from the operand node
-	operandValue := operand.milValue
-
-	// Call the MIL operation
-	resultValue := milOp(operandValue)
+	var resultValue *model.Value
+	if f.isClosureContext() {
+		// In closure context, create a placeholder value.
+		// The actual MIL operation will be built during replayClosureInBlock.
+		placeholderName := fmt.Sprintf("closure_op_%p_%d", f, len(f.builder.nodes))
+		resultValue = f.builder.milBuilder.PlaceholderValue(placeholderName, operand.milValue.DType(), operand.milValue.Shape()...)
+	} else {
+		// In main function context, build the MIL operation directly.
+		operandValue := operand.milValue
+		resultValue = milOp(operandValue)
+	}
 
 	// Create a new node with the result
 	node := f.builder.newNode(opType, outputShape, resultValue, operand)
@@ -353,12 +382,23 @@ func (f *Function) addBinaryOp(
 		return nil, err
 	}
 
-	// Get the MIL Values from the input nodes
-	lhsValue := lhsNode.milValue
-	rhsValue := rhsNode.milValue
-
-	// Call the MIL operation
-	resultValue := milOp(lhsValue, rhsValue)
+	var resultValue *model.Value
+	if f.isClosureContext() {
+		// In closure context, create a placeholder value.
+		// The actual MIL operation will be built during replayClosureInBlock.
+		placeholderName := fmt.Sprintf("closure_op_%p_%d", f, len(f.builder.nodes))
+		milDType, _ := gomlxDTypeToMIL(outputShape.DType)
+		milShape := make([]int64, outputShape.Rank())
+		for i := 0; i < outputShape.Rank(); i++ {
+			milShape[i] = int64(outputShape.Dimensions[i])
+		}
+		resultValue = f.builder.milBuilder.PlaceholderValue(placeholderName, milDType, milShape...)
+	} else {
+		// In main function context, build the MIL operation directly.
+		lhsValue := lhsNode.milValue
+		rhsValue := rhsNode.milValue
+		resultValue = milOp(lhsValue, rhsValue)
+	}
 
 	// Create a new node with the result
 	node := f.builder.newNode(opType, outputShape, resultValue, lhsNode, rhsNode)
@@ -384,12 +424,23 @@ func (f *Function) addComparisonOp(
 		return nil, err
 	}
 
-	// Get the MIL Values from the input nodes
-	lhsValue := lhsNode.milValue
-	rhsValue := rhsNode.milValue
-
-	// Call the MIL operation
-	resultValue := milOp(lhsValue, rhsValue)
+	var resultValue *model.Value
+	if f.isClosureContext() {
+		// In closure context, create a placeholder value.
+		// The actual MIL operation will be built during replayClosureInBlock.
+		placeholderName := fmt.Sprintf("closure_op_%p_%d", f, len(f.builder.nodes))
+		milDType, _ := gomlxDTypeToMIL(outputShape.DType)
+		milShape := make([]int64, outputShape.Rank())
+		for i := 0; i < outputShape.Rank(); i++ {
+			milShape[i] = int64(outputShape.Dimensions[i])
+		}
+		resultValue = f.builder.milBuilder.PlaceholderValue(placeholderName, milDType, milShape...)
+	} else {
+		// In main function context, build the MIL operation directly.
+		lhsValue := lhsNode.milValue
+		rhsValue := rhsNode.milValue
+		resultValue = milOp(lhsValue, rhsValue)
+	}
 
 	// Create a new node with the result
 	node := f.builder.newNode(opType, outputShape, resultValue, lhsNode, rhsNode)
@@ -941,40 +992,388 @@ func (f *Function) Sort(comparator backends.Function, axis int, isStable bool, i
 
 // While executes a loop while a condition is true.
 //
-// Note: CoreML MIL does support while_loop operations at the spec level via nested blocks,
-// but the go-coreml implementation does not yet support building control flow operations.
+// CoreML MIL supports while_loop operations via nested blocks.
 // See https://apple.github.io/coremltools/source/coremltools.converters.mil.mil.ops.defs.html
 // for CoreML MIL control flow documentation.
 //
-// Workarounds:
-//   - Unroll the loop at graph construction time if the iteration count is known
-//   - Use a different backend (e.g., XLA) for models that require dynamic loops
-//   - Refactor the computation to avoid loops where possible
+// Parameters:
+//   - cond: A closure Function that takes the loop variables as parameters and returns a boolean scalar
+//   - body: A closure Function that takes the loop variables as parameters and returns updated loop variables
+//   - initialState: The initial values for the loop variables
+//
+// Returns the final values of the loop variables when the condition becomes false.
 func (f *Function) While(cond, body backends.Function, initialState ...backends.Value) ([]backends.Value, error) {
-	return nil, errors.Wrapf(
-		notimplemented.NotImplementedError,
-		"While loops are not yet implemented in the go-coreml library. "+
-			"CoreML MIL supports while_loop via nested blocks, but go-coreml has not implemented this feature. "+
-			"Consider unrolling the loop if the iteration count is known, or use a different backend for %q", BackendName)
+	if err := f.CheckValid(); err != nil {
+		return nil, err
+	}
+
+	// Validate initial state
+	if len(initialState) == 0 {
+		return nil, errors.Errorf("While: at least one initial state value is required")
+	}
+
+	initialNodes, err := f.builder.checkOps("While", initialState...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate cond function
+	condF, ok := cond.(*Function)
+	if !ok {
+		return nil, errors.Errorf("While: cond function must be a CoreML Function, got %T", cond)
+	}
+	if condF.parent != f {
+		return nil, errors.Errorf("While: cond function must be a closure of the current function")
+	}
+	if !condF.returned {
+		return nil, errors.Errorf("While: cond function must have called Return()")
+	}
+	if len(condF.outputs) != 1 {
+		return nil, errors.Errorf("While: cond function must return exactly one value (bool), got %d", len(condF.outputs))
+	}
+	if condF.outputs[0].shape.DType != dtypes.Bool {
+		return nil, errors.Errorf("While: cond function must return Bool, got %s", condF.outputs[0].shape.DType)
+	}
+	if condF.outputs[0].shape.Rank() != 0 {
+		return nil, errors.Errorf("While: cond function must return a scalar, got rank %d", condF.outputs[0].shape.Rank())
+	}
+
+	// Validate body function
+	bodyF, ok := body.(*Function)
+	if !ok {
+		return nil, errors.Errorf("While: body function must be a CoreML Function, got %T", body)
+	}
+	if bodyF.parent != f {
+		return nil, errors.Errorf("While: body function must be a closure of the current function")
+	}
+	if !bodyF.returned {
+		return nil, errors.Errorf("While: body function must have called Return()")
+	}
+	if len(bodyF.outputs) != len(initialState) {
+		return nil, errors.Errorf("While: body function must return %d values (matching initial state), got %d",
+			len(initialState), len(bodyF.outputs))
+	}
+
+	// Validate that body outputs match initial state shapes
+	for i, out := range bodyF.outputs {
+		if !out.shape.Equal(initialNodes[i].shape) {
+			return nil, errors.Errorf("While: body output %d shape %s doesn't match initial state shape %s",
+				i, out.shape, initialNodes[i].shape)
+		}
+	}
+
+	// Validate parameter counts match
+	if len(condF.parameters) != len(initialState) {
+		return nil, errors.Errorf("While: cond function has %d parameters but initial state has %d values",
+			len(condF.parameters), len(initialState))
+	}
+	if len(bodyF.parameters) != len(initialState) {
+		return nil, errors.Errorf("While: body function has %d parameters but initial state has %d values",
+			len(bodyF.parameters), len(initialState))
+	}
+
+	// Convert initial state to MIL values
+	loopVars := make([]*model.Value, len(initialNodes))
+	for i, n := range initialNodes {
+		loopVars[i] = n.milValue
+	}
+
+	// Build the while_loop using the MIL layer
+	// The MIL layer's WhileLoop expects callback functions that build operations in a BlockBuilder
+	resultValues := f.builder.milBuilder.WhileLoop(
+		loopVars,
+		func(bb *model.BlockBuilder, vars []*model.Value) *model.Value {
+			// Build condition block by replaying the cond closure operations
+			return f.replayClosureInBlock(bb, condF, vars)[0]
+		},
+		func(bb *model.BlockBuilder, vars []*model.Value) []*model.Value {
+			// Build body block by replaying the body closure operations
+			return f.replayClosureInBlock(bb, bodyF, vars)
+		},
+	)
+
+	if f.builder.milBuilder.Err() != nil {
+		return nil, errors.Wrap(f.builder.milBuilder.Err(), "While")
+	}
+
+	// Create output nodes
+	outputNodes := make([]backends.Value, len(resultValues))
+	for i, v := range resultValues {
+		node := f.builder.newNode(backends.OpTypeWhile, initialNodes[i].shape, v)
+		outputNodes[i] = node
+	}
+
+	return outputNodes, nil
 }
 
 // If executes one of two branches based on a boolean predicate.
 //
-// Note: CoreML MIL does support conditional (cond) operations at the spec level via nested blocks,
-// but the go-coreml implementation does not yet support building control flow operations.
+// CoreML MIL supports conditional (cond) operations via nested blocks.
 // See https://apple.github.io/coremltools/source/coremltools.converters.mil.mil.ops.defs.html
 // for CoreML MIL control flow documentation.
 //
-// Workarounds:
-//   - Use Where() for element-wise conditional selection (already supported)
-//   - Compute both branches and use Where() to select results based on condition
-//   - Use a different backend (e.g., XLA) for models that require dynamic conditionals
+// Parameters:
+//   - pred: A boolean scalar value that determines which branch to execute
+//   - trueBranch: A closure Function that produces outputs when pred is true
+//   - falseBranch: A closure Function that produces outputs when pred is false
+//
+// Both branches must return the same number of outputs with matching shapes.
+// Returns the outputs from the executed branch.
 func (f *Function) If(pred backends.Value, trueBranch, falseBranch backends.Function) ([]backends.Value, error) {
-	return nil, errors.Wrapf(
-		notimplemented.NotImplementedError,
-		"If conditionals are not yet implemented in the go-coreml library. "+
-			"CoreML MIL supports cond via nested blocks, but go-coreml has not implemented this feature. "+
-			"Consider using Where() for element-wise selection, or use a different backend for %q", BackendName)
+	if err := f.CheckValid(); err != nil {
+		return nil, err
+	}
+
+	// Validate predicate
+	predNodes, err := f.builder.checkOps("If", pred)
+	if err != nil {
+		return nil, err
+	}
+	predNode := predNodes[0]
+
+	if predNode.shape.DType != dtypes.Bool {
+		return nil, errors.Errorf("If: pred must be Bool, got %s", predNode.shape.DType)
+	}
+	if predNode.shape.Rank() != 0 {
+		return nil, errors.Errorf("If: pred must be a scalar, got rank %d", predNode.shape.Rank())
+	}
+
+	// Validate true branch
+	trueF, ok := trueBranch.(*Function)
+	if !ok {
+		return nil, errors.Errorf("If: trueBranch must be a CoreML Function, got %T", trueBranch)
+	}
+	if trueF.parent != f {
+		return nil, errors.Errorf("If: trueBranch must be a closure of the current function")
+	}
+	if !trueF.returned {
+		return nil, errors.Errorf("If: trueBranch must have called Return()")
+	}
+	if len(trueF.outputs) == 0 {
+		return nil, errors.Errorf("If: trueBranch must return at least one value")
+	}
+
+	// Validate false branch
+	falseF, ok := falseBranch.(*Function)
+	if !ok {
+		return nil, errors.Errorf("If: falseBranch must be a CoreML Function, got %T", falseBranch)
+	}
+	if falseF.parent != f {
+		return nil, errors.Errorf("If: falseBranch must be a closure of the current function")
+	}
+	if !falseF.returned {
+		return nil, errors.Errorf("If: falseBranch must have called Return()")
+	}
+
+	// Validate output counts match
+	if len(trueF.outputs) != len(falseF.outputs) {
+		return nil, errors.Errorf("If: trueBranch has %d outputs but falseBranch has %d outputs",
+			len(trueF.outputs), len(falseF.outputs))
+	}
+
+	// Validate output shapes match
+	for i := range trueF.outputs {
+		if !trueF.outputs[i].shape.Equal(falseF.outputs[i].shape) {
+			return nil, errors.Errorf("If: output %d shape mismatch: trueBranch %s, falseBranch %s",
+				i, trueF.outputs[i].shape, falseF.outputs[i].shape)
+		}
+	}
+
+	// If branches have no parameters, they just return values from the parent scope
+	// Build the cond operation using the MIL layer
+	resultValues := f.builder.milBuilder.Cond(
+		predNode.milValue,
+		func(bb *model.BlockBuilder) []*model.Value {
+			// Build true branch by replaying the trueBranch closure operations
+			return f.replayClosureInBlock(bb, trueF, nil)
+		},
+		func(bb *model.BlockBuilder) []*model.Value {
+			// Build false branch by replaying the falseBranch closure operations
+			return f.replayClosureInBlock(bb, falseF, nil)
+		},
+	)
+
+	if f.builder.milBuilder.Err() != nil {
+		return nil, errors.Wrap(f.builder.milBuilder.Err(), "If")
+	}
+
+	// Create output nodes
+	outputNodes := make([]backends.Value, len(resultValues))
+	for i, v := range resultValues {
+		node := f.builder.newNode(backends.OpTypeIf, trueF.outputs[i].shape, v)
+		outputNodes[i] = node
+	}
+
+	return outputNodes, nil
+}
+
+// replayClosureInBlock replays a closure's operations inside a MIL BlockBuilder.
+// This is used to convert GoMLX closure Functions into MIL nested blocks for control flow.
+//
+// The closure's parameters are mapped to the provided blockInputs (for While loops)
+// or the closure may have no parameters (for If branches that just use parent scope values).
+//
+// Values from the parent scope are referenced directly since MIL blocks can access
+// values defined in the parent scope.
+func (f *Function) replayClosureInBlock(bb *model.BlockBuilder, closure *Function, blockInputs []*model.Value) []*model.Value {
+	// Map from original node builderIdx to the replayed value in the block
+	valueMap := make(map[int]*model.Value)
+
+	// Map closure parameters to block inputs
+	for i, param := range closure.parameters {
+		if i < len(blockInputs) {
+			valueMap[param.builderIdx] = blockInputs[i]
+		}
+	}
+
+	// Get the compiled closure info for proper node ordering
+	cc := closure.compiled
+	if cc == nil {
+		// Closure wasn't pre-compiled, this shouldn't happen for valid closures
+		// Fall back to direct output reference (works for simple cases)
+		outputs := make([]*model.Value, len(closure.outputs))
+		for i, out := range closure.outputs {
+			outputs[i] = out.milValue
+		}
+		return outputs
+	}
+
+	// Build a set of closure node indices for quick lookup
+	closureNodeSet := make(map[int]bool)
+	for _, node := range cc.sortedNodes {
+		closureNodeSet[node.builderIdx] = true
+	}
+
+	// Also mark closure parameters as belonging to the closure
+	for _, param := range closure.parameters {
+		closureNodeSet[param.builderIdx] = true
+	}
+
+	// Replay each node in topological order
+	for _, node := range cc.sortedNodes {
+		// Skip if already mapped (e.g., parameters)
+		if _, ok := valueMap[node.builderIdx]; ok {
+			continue
+		}
+
+		// Check if this node is a closure parameter (handled separately)
+		isClosureParam := false
+		for _, param := range closure.parameters {
+			if param.builderIdx == node.builderIdx {
+				isClosureParam = true
+				break
+			}
+		}
+		if isClosureParam {
+			// Closure parameters should already be mapped from blockInputs
+			continue
+		}
+
+		// Check if ALL inputs of this node come from parent scope
+		// If so, we can reference the original value directly
+		// Otherwise, we need to replay the operation
+		allInputsFromParent := true
+		for _, input := range node.inputs {
+			if closureNodeSet[input.builderIdx] {
+				allInputsFromParent = false
+				break
+			}
+		}
+
+		if allInputsFromParent && node.opType != backends.OpTypeParameter && node.opType != backends.OpTypeConstant {
+			// This node's operation was computed in parent scope, reference it directly
+			valueMap[node.builderIdx] = node.milValue
+			continue
+		}
+
+		// Replay the operation in the block
+		replayedValue := f.replayNodeInBlock(bb, node, valueMap)
+		if replayedValue != nil {
+			valueMap[node.builderIdx] = replayedValue
+		}
+	}
+
+	// Return the outputs
+	outputs := make([]*model.Value, len(closure.outputs))
+	for i, out := range closure.outputs {
+		if v, ok := valueMap[out.builderIdx]; ok {
+			outputs[i] = v
+		} else {
+			// Fallback: use the original MIL value (parent scope reference)
+			outputs[i] = out.milValue
+		}
+	}
+	return outputs
+}
+
+// replayNodeInBlock replays a single node's operation in a BlockBuilder.
+// This is a limited implementation that supports common operations used in control flow.
+func (f *Function) replayNodeInBlock(bb *model.BlockBuilder, node *Node, valueMap map[int]*model.Value) *model.Value {
+	// Get input values
+	inputs := make([]*model.Value, len(node.inputs))
+	for i, input := range node.inputs {
+		if v, ok := valueMap[input.builderIdx]; ok {
+			inputs[i] = v
+		} else {
+			// Use the original MIL value (parent scope)
+			inputs[i] = input.milValue
+		}
+	}
+
+	// Replay based on operation type
+	switch node.opType {
+	case backends.OpTypeParameter:
+		// Parameters are handled separately via blockInputs
+		return nil
+
+	case backends.OpTypeConstant:
+		// Constants can be referenced from parent scope in MIL blocks
+		return node.milValue
+
+	// Binary operations
+	case backends.OpTypeAdd:
+		if len(inputs) >= 2 {
+			return bb.Add(inputs[0], inputs[1])
+		}
+	case backends.OpTypeSub:
+		if len(inputs) >= 2 {
+			return bb.Sub(inputs[0], inputs[1])
+		}
+	case backends.OpTypeMul:
+		if len(inputs) >= 2 {
+			return bb.Mul(inputs[0], inputs[1])
+		}
+
+	// Comparison operations
+	case backends.OpTypeLessThan:
+		if len(inputs) >= 2 {
+			return bb.Less(inputs[0], inputs[1])
+		}
+	case backends.OpTypeGreaterThan:
+		if len(inputs) >= 2 {
+			return bb.Greater(inputs[0], inputs[1])
+		}
+
+	// Logical operations
+	case backends.OpTypeLogicalAnd:
+		if len(inputs) >= 2 {
+			return bb.LogicalAnd(inputs[0], inputs[1])
+		}
+
+	// Selection
+	case backends.OpTypeWhere:
+		if len(inputs) >= 3 {
+			return bb.Select(inputs[0], inputs[1], inputs[2])
+		}
+
+	default:
+		// For unsupported operations, try to reference the original value
+		// This works for operations whose inputs are all from parent scope
+		return node.milValue
+	}
+
+	// Fallback
+	return node.milValue
 }
 
 // Where selects elements from onTrue or onFalse based on the condition.
@@ -1346,8 +1745,16 @@ func (f *Function) Concatenate(axis int, operands ...backends.Value) (backends.V
 //   - len(collapsedSliceAxes) == len(startIndexMap)
 //   - All collapsed axes have sliceSize == 1
 //
+// Pattern 3: GatherSlices with slice_size=1 (single-axis, no collapse)
+// - Gather slices along one axis without collapsing the indexed dimension
+// - Example: params[10, 8], indices[3, 1] -> output[3, 1, 8]
+// - Requirements:
+//   - len(startIndexMap) == 1
+//   - len(collapsedSliceAxes) == 0
+//   - sliceSizes[gatherAxis] == 1
+//
 // NOT SUPPORTED (returns error):
-// - GatherSlices pattern (gather without collapsing dimensions)
+// - GatherSlices with slice_size > 1
 // - Non-contiguous multi-axis gather
 // - Partial multi-axis gather (some axes collapsed, some not)
 func (f *Function) Gather(
@@ -1480,15 +1887,62 @@ func (f *Function) Gather(
 	// This is used by GoMLX's GatherSlices operation
 	// - len(startIndexMap) == 1 (gathering along one axis)
 	// - len(collapsedSliceAxes) == 0 (no collapsing)
-	// This requires using slice_by_size with dynamic start positions, which is more complex.
-	// For now, we provide a helpful error message.
+	//
+	// For slice_size=1 on the gathered axis, we can use:
+	// 1. CoreML Gather (which collapses the axis)
+	// 2. ExpandDims to restore the size-1 dimension
+	//
+	// For slice_size > 1, this is more complex and not yet supported.
 	if len(startIndexMap) == 1 && len(collapsedSliceAxes) == 0 {
+		gatherAxis := startIndexMap[0]
+		sliceSize := sliceSizes[gatherAxis]
+
+		if sliceSize == 1 {
+			// Case: GatherSlices with slice_size=1 on the gathered axis
+			// This can be implemented as Gather + ExpandDims
+
+			// Prepare indices: squeeze out the indexVectorAxis dimension
+			indicesValue := startIndicesNode.milValue
+			if indexVectorAxis < startIndicesNode.shape.Rank() && startIndicesNode.shape.Dimensions[indexVectorAxis] == 1 {
+				axes := []int64{int64(indexVectorAxis)}
+				indicesValue = f.builder.milBuilder.Squeeze(indicesValue, axes)
+			}
+
+			// Step 1: Use CoreML Gather which collapses the gathered axis
+			// For params[A, B, C] with gather on axis 0 and indices[N]:
+			// Gather gives [N, B, C]
+			gatheredValue := f.builder.milBuilder.Gather(operandNode.milValue, indicesValue, int64(gatherAxis))
+
+			// Step 2: Insert the collapsed axis back with size 1
+			// The gathered axis position in the output is determined by offsetOutputAxes
+			// We need to find where to insert the size-1 dimension
+			//
+			// In the output shape from shapeinference, the gathered axis already has size 1
+			// due to sliceSize=1. We need to find the output axis that corresponds to the gathered axis.
+			//
+			// offsetOutputAxes tells us where each non-collapsed operand axis goes in the output.
+			// Since no axes are collapsed, all operand axes have entries in offsetOutputAxes.
+			// The order of offsetOutputAxes matches the order of non-collapsed axes in operand
+			// (i.e., axes not in collapsedSliceAxes, which is all of them here).
+			//
+			// So offsetOutputAxes[gatherAxis] gives us the output axis for the gathered axis.
+			insertAxis := offsetOutputAxes[gatherAxis]
+
+			// ExpandDims to restore the size-1 dimension
+			resultValue := f.builder.milBuilder.ExpandDims(gatheredValue, []int64{int64(insertAxis)})
+
+			node := f.builder.newNode(opType, outputShape, resultValue, operandNode, startIndicesNode)
+			return node, nil
+		}
+
+		// For slice_size > 1, we need a more complex approach
+		// TODO: Implement using Concat of SliceBySize operations or reshape tricks
 		return nil, errors.Wrapf(
 			notimplemented.NotImplementedError,
-			"GatherSlices (Gather with no collapsed axes) not yet supported for %q builder. "+
-				"This pattern extracts slices without collapsing dimensions. "+
-				"Parameters: startIndexMap=%v, sliceSizes=%v, offsetOutputAxes=%v",
-			BackendName, startIndexMap, sliceSizes, offsetOutputAxes)
+			"GatherSlices with slice_size > 1 not yet supported for %q builder. "+
+				"Only slice_size=1 on the gathered axis is currently supported. "+
+				"Parameters: gatherAxis=%d, sliceSize=%d, startIndexMap=%v, sliceSizes=%v",
+			BackendName, gatherAxis, sliceSize, startIndexMap, sliceSizes)
 	}
 
 	// For other complex Gather patterns, provide detailed error message
@@ -1931,12 +2385,23 @@ func (f *Function) ConvGeneral(
 		}
 	}
 
-	// Check for input dilations - CoreML doesn't support them directly
-	// TODO: Implement input dilation support via explicit padding/spacing
+	// Check for input dilations - CoreML doesn't support them directly.
+	// Note: CoreML Conv supports "dilations" parameter but that controls KERNEL dilation
+	// (spacing between kernel elements), NOT input dilation (spacing between input elements).
+	// Input dilation would require inserting zeros between input elements before convolution,
+	// which is computationally expensive and not natively supported.
 	if inputDilations != nil {
-		for _, d := range inputDilations {
+		for i, d := range inputDilations {
 			if d > 1 {
-				return nil, errors.Errorf("ConvGeneral: input dilations > 1 are not directly supported by CoreML backend")
+				return nil, errors.Errorf(
+					"ConvGeneral: input dilation (also called 'base dilation') is not supported by CoreML backend. "+
+						"Got inputDilations[%d]=%d, but only dilation=1 is supported. "+
+						"Note: CoreML supports KERNEL dilation (spacing in the kernel weights) via the 'dilations' parameter, "+
+						"but NOT input dilation (inserting zeros between input elements). "+
+						"Workarounds: (1) pre-process your input to insert zeros manually before convolution, "+
+						"(2) use a different backend (e.g., XLA) that supports input dilation, or "+
+						"(3) restructure your model to avoid input dilation",
+					i, d)
 			}
 		}
 	}
