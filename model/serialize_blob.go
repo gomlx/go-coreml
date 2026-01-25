@@ -113,8 +113,9 @@ func extractFromBlock(block *milspec.Block, w *blob.Writer, threshold int64) err
 	return nil
 }
 
-// extractFromOperation extracts tensors from an operation's inputs.
+// extractFromOperation extracts tensors from an operation's inputs and nested blocks.
 func extractFromOperation(op *milspec.Operation, w *blob.Writer, threshold int64) error {
+	// Extract from inputs
 	for _, arg := range op.GetInputs() {
 		for _, binding := range arg.GetArguments() {
 			if val := binding.GetValue(); val != nil {
@@ -124,6 +125,14 @@ func extractFromOperation(op *milspec.Operation, w *blob.Writer, threshold int64
 			}
 		}
 	}
+
+	// Recursively extract from nested blocks (for control flow operations like cond, while_loop)
+	for _, nestedBlock := range op.GetBlocks() {
+		if err := extractFromBlock(nestedBlock, w, threshold); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 

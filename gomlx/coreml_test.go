@@ -6,6 +6,7 @@ package coreml
 
 import (
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/gomlx/gomlx/backends"
@@ -1187,5 +1188,124 @@ func TestWhereScalarCondition(t *testing.T) {
 		if math.Abs(float64(outputData[i]-expected[i])) > 1e-5 {
 			t.Errorf("outputData[%d] = %f, want %f", i, outputData[i], expected[i])
 		}
+	}
+}
+
+// TestCallNotSupported tests that the Call operation returns a not-implemented error
+// with a helpful message explaining the CoreML MIL limitation.
+func TestCallNotSupported(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("test_call")
+	mainFn := builder.Main()
+
+	// Create a named function (not a closure)
+	namedFn, err := builder.NewFunction("helper")
+	if err != nil {
+		t.Fatalf("NewFunction() failed: %v", err)
+	}
+
+	// Set up the named function with a simple parameter and return
+	shape := shapes.Make(dtypes.Float32, 4)
+	param, err := namedFn.Parameter("x", shape, nil)
+	if err != nil {
+		t.Fatalf("Parameter() failed for named function: %v", err)
+	}
+	err = namedFn.Return([]backends.Value{param}, nil)
+	if err != nil {
+		t.Fatalf("Return() failed for named function: %v", err)
+	}
+
+	// Now try to call the named function from main - this should fail
+	mainParam, err := mainFn.Parameter("input", shape, nil)
+	if err != nil {
+		t.Fatalf("Parameter() failed for main function: %v", err)
+	}
+
+	// Call should return an error explaining that CoreML doesn't support function calls
+	_, err = mainFn.Call(namedFn, mainParam)
+	if err == nil {
+		t.Fatal("Call() should have returned an error, but returned nil")
+	}
+
+	// Verify the error message is helpful
+	errMsg := err.Error()
+	errMsgLower := strings.ToLower(errMsg)
+	if !strings.Contains(errMsgLower, "not supported") && !strings.Contains(errMsgLower, "not implemented") {
+		t.Errorf("Error message should indicate not supported/implemented, got: %s", errMsg)
+	}
+	if !strings.Contains(errMsgLower, "coreml") {
+		t.Errorf("Error message should mention CoreML, got: %s", errMsg)
+	}
+}
+
+// TestSortNotSupported tests that the Sort operation returns a not-implemented error
+// with a helpful message explaining the CoreML MIL limitation and suggesting alternatives.
+func TestSortNotSupported(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("test_sort")
+	mainFn := builder.Main()
+
+	// Create a closure for the comparator (even though Sort won't be supported)
+	comparator, err := mainFn.Closure()
+	if err != nil {
+		t.Fatalf("Closure() failed: %v", err)
+	}
+
+	// Set up a simple comparator that compares two scalars
+	shape := shapes.Make(dtypes.Float32)
+	lhs, err := comparator.Parameter("lhs", shape, nil)
+	if err != nil {
+		t.Fatalf("Parameter(lhs) failed: %v", err)
+	}
+	rhs, err := comparator.Parameter("rhs", shape, nil)
+	if err != nil {
+		t.Fatalf("Parameter(rhs) failed: %v", err)
+	}
+
+	// lhs < rhs for ascending sort
+	lessThan, err := comparator.LessThan(lhs, rhs)
+	if err != nil {
+		t.Fatalf("LessThan() failed: %v", err)
+	}
+	err = comparator.Return([]backends.Value{lessThan}, nil)
+	if err != nil {
+		t.Fatalf("Return() failed for comparator: %v", err)
+	}
+
+	// Create an input tensor to sort
+	inputShape := shapes.Make(dtypes.Float32, 5)
+	input, err := mainFn.Parameter("input", inputShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter(input) failed: %v", err)
+	}
+
+	// Sort should return an error explaining that custom comparators aren't supported
+	_, err = mainFn.Sort(comparator, 0, false, input)
+	if err == nil {
+		t.Fatal("Sort() should have returned an error, but returned nil")
+	}
+
+	// Verify the error message is helpful
+	errMsg := err.Error()
+	errMsgLower := strings.ToLower(errMsg)
+	if !strings.Contains(errMsgLower, "not supported") && !strings.Contains(errMsgLower, "not implemented") {
+		t.Errorf("Error message should indicate not supported/implemented, got: %s", errMsg)
+	}
+	if !strings.Contains(errMsgLower, "coreml") {
+		t.Errorf("Error message should mention CoreML, got: %s", errMsg)
+	}
+	// The error message should suggest alternatives (argsort, topk, or different backend)
+	if !strings.Contains(errMsgLower, "argsort") && !strings.Contains(errMsgLower, "topk") {
+		t.Errorf("Error message should suggest argsort or topk as alternatives, got: %s", errMsg)
 	}
 }

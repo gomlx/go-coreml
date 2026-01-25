@@ -890,17 +890,53 @@ func (f *Function) Transpose(x backends.Value, permutation ...int) (backends.Val
 }
 
 // Call calls a function with the given inputs.
+//
+// Note: CoreML MIL does not support function calls at the IR level. Unlike XLA/StableHLO
+// which has a dedicated "call" operation, MIL Programs define multiple independent functions
+// that serve as entry points but cannot call each other during execution.
+//
+// MIL's control flow operations (cond, while_loop) use nested blocks rather than function calls.
+// See https://apple.github.io/coremltools/source/coremltools.converters.mil.mil.ops.defs.html
+//
+// Workarounds:
+//   - Inline the function body: Instead of calling a function, duplicate the operations
+//     at the call site. This is the most straightforward approach for simple functions.
+//   - Use a different backend: XLA backend supports function calls via StableHLO's call op.
+//   - Refactor computation: If the function is used for control flow (While, If, Sort),
+//     those operations use closures which are handled differently (via nested blocks).
 func (f *Function) Call(fn backends.Function, inputs ...backends.Value) ([]backends.Value, error) {
 	return nil, errors.Wrapf(
 		notimplemented.NotImplementedError,
-		"Call not yet supported for %q builder", BackendName)
+		"Call is not supported for %q builder: CoreML MIL does not have a function call operation. "+
+			"Consider inlining the function body at the call site, or use a different backend (e.g., XLA) "+
+			"for computations that require function calls", BackendName)
 }
 
 // Sort sorts one or more tensors along the specified axis using a comparator closure.
+//
+// Note: CoreML MIL does not support custom comparator functions for sorting.
+// The generic Sort API requires a comparator closure that defines the ordering,
+// which cannot be expressed in CoreML's operation graph.
+//
+// CoreML MIL does provide these sorting-related operations:
+//   - argsort: Returns indices that would sort a tensor (ascending or descending)
+//   - topk: Returns the k largest or smallest values and their indices
+//
+// Workarounds:
+//   - For simple ascending/descending sorts of a single tensor, use the graph.Argsort()
+//     operation followed by graph.Gather() to reorder the tensor.
+//   - For top-k operations, use graph.TopK() which is more efficient than full sorting.
+//   - Use a different backend (e.g., XLA) for computations that require custom comparators
+//     or stable multi-tensor sorting.
+//
+// See also: model.Builder.Argsort() and model.Builder.TopK() for lower-level MIL operations.
 func (f *Function) Sort(comparator backends.Function, axis int, isStable bool, inputs ...backends.Value) ([]backends.Value, error) {
 	return nil, errors.Wrapf(
 		notimplemented.NotImplementedError,
-		"Sort not yet supported for %q builder", BackendName)
+		"Sort with custom comparator is not supported for %q builder: CoreML MIL does not support "+
+			"custom comparator functions. For simple ascending/descending sorts, consider using "+
+			"Argsort + Gather operations. For top-k values, use TopK. For complex sorting with "+
+			"custom comparators, use a different backend (e.g., XLA)", BackendName)
 }
 
 // While executes a loop while a condition is true.
@@ -1290,6 +1326,30 @@ func (f *Function) Concatenate(axis int, operands ...backends.Value) (backends.V
 }
 
 // Gather implements backends.Function.
+//
+// CoreML backend supports the following Gather patterns:
+//
+// Pattern 1: Simple single-axis gather (embedding lookup)
+// - Gather elements along one axis with the indexed dimension collapsed
+// - Example: params[10, 8], indices[3] -> output[3, 8]
+// - Requirements:
+//   - len(startIndexMap) == 1
+//   - len(collapsedSliceAxes) == 1
+//   - collapsedSliceAxes[0] == startIndexMap[0]
+//   - sliceSizes[axis] == 1 for the gathered axis
+//
+// Pattern 2: Multi-axis gather (GatherND pattern)
+// - Gather elements using multi-dimensional indices into contiguous leading axes
+// - Example: params[4, 3, 5], indices[2, 2] -> output[2, 5] (indexing into axes 0,1)
+// - Requirements:
+//   - startIndexMap must be contiguous from axis 0: [0, 1, 2, ...]
+//   - len(collapsedSliceAxes) == len(startIndexMap)
+//   - All collapsed axes have sliceSize == 1
+//
+// NOT SUPPORTED (returns error):
+// - GatherSlices pattern (gather without collapsing dimensions)
+// - Non-contiguous multi-axis gather
+// - Partial multi-axis gather (some axes collapsed, some not)
 func (f *Function) Gather(
 	operand, startIndices backends.Value,
 	indexVectorAxis int,
@@ -1313,16 +1373,25 @@ func (f *Function) Gather(
 		return nil, err
 	}
 
-	// CoreML's gather operation has a simpler interface: gather(x, indices, axis)
-	// It gathers slices from x at positions specified by indices along a single axis.
+	// CoreML MIL provides several gather operations:
+	// 1. gather(x, indices, axis) - Gathers slices along a single axis
+	//    Output shape: x.shape[:axis] + indices.shape + x.shape[axis+1:]
+	// 2. gather_nd(x, indices) - Multi-dimensional gather using last dim of indices as coordinates
+	// 3. gather_along_axis(x, indices, axis) - Like torch.gather, indices has same rank as x
 	//
-	// XLA's Gather is more complex with multiple axes and collapsed slices.
-	// We need to check if this is a simple case that can be mapped directly to CoreML's gather.
+	// XLA's Gather is more general with these parameters:
+	// - startIndexMap: maps index vector elements to operand axes
+	// - collapsedSliceAxes: operand axes to collapse (must have sliceSize=1)
+	// - offsetOutputAxes: output axes for non-collapsed slice dimensions
+	// - sliceSizes: size of slice along each operand axis
 	//
-	// Simple case: single axis gather where:
+	// We support several patterns:
+
+	// Pattern 1: Simple single-axis gather with collapsed dimension
+	// This is the most common case (e.g., embedding lookup)
 	// - len(startIndexMap) == 1 (gathering along one axis)
-	// - len(collapsedSliceAxes) == 1 (collapsing that axis)
-	// - collapsedSliceAxes[0] == startIndexMap[0] (same axis)
+	// - len(collapsedSliceAxes) == 1 (collapsing that same axis)
+	// - collapsedSliceAxes[0] == startIndexMap[0]
 	// - sliceSizes[axis] == 1 for the gathered axis
 	if len(startIndexMap) == 1 && len(collapsedSliceAxes) == 1 &&
 		collapsedSliceAxes[0] == startIndexMap[0] &&
@@ -1348,12 +1417,88 @@ func (f *Function) Gather(
 		return node, nil
 	}
 
-	// For complex Gather operations, we would need to decompose into multiple CoreML ops
-	// For now, return not implemented for complex cases
+	// Pattern 2: Multi-axis gather with all axes collapsed
+	// This maps to CoreML's gather operation with a reshape/slice sequence
+	// - len(collapsedSliceAxes) == len(startIndexMap) (all indexed axes are collapsed)
+	// - All indexed axes have sliceSize == 1
+	// - The indexed axes must be contiguous starting from axis 0
+	if len(collapsedSliceAxes) == len(startIndexMap) && len(startIndexMap) > 1 {
+		// Check if startIndexMap is contiguous from 0
+		isContiguousFromZero := true
+		for i, axis := range startIndexMap {
+			if axis != i {
+				isContiguousFromZero = false
+				break
+			}
+		}
+
+		// Check all collapsed axes have sliceSize 1
+		allSliceSizeOne := true
+		for _, axis := range collapsedSliceAxes {
+			if sliceSizes[axis] != 1 {
+				allSliceSizeOne = false
+				break
+			}
+		}
+
+		if isContiguousFromZero && allSliceSizeOne {
+			// This is a GatherND case - multi-dimensional indexing into the first N axes
+			// CoreML's gather_nd takes indices of shape [..., N] where N is the number of
+			// dimensions to index into, and gathers slices from the input.
+
+			// Prepare indices: we need to ensure the index vector dimension is at the end
+			indicesValue := startIndicesNode.milValue
+			indicesShape := startIndicesNode.shape
+
+			// If indexVectorAxis is not the last axis, we need to transpose
+			if indexVectorAxis != indicesShape.Rank()-1 {
+				// Create permutation to move indexVectorAxis to the end
+				perm := make([]int64, indicesShape.Rank())
+				j := 0
+				for i := 0; i < indicesShape.Rank(); i++ {
+					if i == indexVectorAxis {
+						continue
+					}
+					perm[j] = int64(i)
+					j++
+				}
+				perm[indicesShape.Rank()-1] = int64(indexVectorAxis)
+				indicesValue = f.builder.milBuilder.Transpose(indicesValue, perm)
+			}
+
+			// Call the MIL GatherND operation
+			resultValue := f.builder.milBuilder.GatherND(operandNode.milValue, indicesValue)
+
+			// Create a new node with the result
+			node := f.builder.newNode(opType, outputShape, resultValue, operandNode, startIndicesNode)
+
+			return node, nil
+		}
+	}
+
+	// Pattern 3: GatherSlices - single axis gather without collapsing
+	// This is used by GoMLX's GatherSlices operation
+	// - len(startIndexMap) == 1 (gathering along one axis)
+	// - len(collapsedSliceAxes) == 0 (no collapsing)
+	// This requires using slice_by_size with dynamic start positions, which is more complex.
+	// For now, we provide a helpful error message.
+	if len(startIndexMap) == 1 && len(collapsedSliceAxes) == 0 {
+		return nil, errors.Wrapf(
+			notimplemented.NotImplementedError,
+			"GatherSlices (Gather with no collapsed axes) not yet supported for %q builder. "+
+				"This pattern extracts slices without collapsing dimensions. "+
+				"Parameters: startIndexMap=%v, sliceSizes=%v, offsetOutputAxes=%v",
+			BackendName, startIndexMap, sliceSizes, offsetOutputAxes)
+	}
+
+	// For other complex Gather patterns, provide detailed error message
 	return nil, errors.Wrapf(
 		notimplemented.NotImplementedError,
-		"complex Gather with multiple axes not yet supported for %q builder (startIndexMap=%v, collapsedSliceAxes=%v)",
-		BackendName, startIndexMap, collapsedSliceAxes)
+		"complex Gather pattern not yet supported for %q builder. "+
+			"Supported patterns: (1) single-axis gather with collapse (standard embedding lookup), "+
+			"(2) multi-axis gather with all axes collapsed from axis 0 (GatherND pattern). "+
+			"Got: startIndexMap=%v, collapsedSliceAxes=%v, offsetOutputAxes=%v, sliceSizes=%v",
+		BackendName, startIndexMap, collapsedSliceAxes, offsetOutputAxes, sliceSizes)
 }
 
 // Pad implements backends.Function.
