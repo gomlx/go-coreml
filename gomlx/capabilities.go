@@ -87,6 +87,26 @@ var Capabilities = backends.Capabilities{
 		backends.OpTypeConvertDType: true,
 		backends.OpTypeWhere:        true,
 		backends.OpTypeIota:         true,
+
+		// Logical operations
+		backends.OpTypeLogicalAnd: true,
+		backends.OpTypeLogicalOr:  true,
+		backends.OpTypeLogicalNot: true,
+		backends.OpTypeLogicalXor: true,
+
+		// Floating-point classification
+		backends.OpTypeIsFinite: true,
+		backends.OpTypeIsNaN:    true,
+
+		// Additional tensor operations
+		backends.OpTypeIdentity:       true,
+		backends.OpTypeBroadcastInDim: true,
+		backends.OpTypeClamp:          true,
+		backends.OpTypeDynamicSlice:   true,
+		backends.OpTypeRem:            true,
+
+		// Normalization
+		backends.OpTypeBatchNormForInference: true,
 	},
 
 	DTypes: map[dtypes.DType]bool{

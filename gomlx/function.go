@@ -328,6 +328,23 @@ func (f *Function) isClosureContext() bool {
 	return f.parent != nil
 }
 
+// closurePlaceholder creates a placeholder value for use in closure contexts.
+// This is used when building closure functions (e.g., for While/If) where we can't
+// execute MIL operations directly but need to record the shape for later replay.
+// Returns nil and an error if the dtype is not supported.
+func (f *Function) closurePlaceholder(outputShape shapes.Shape) (*model.Value, error) {
+	placeholderName := fmt.Sprintf("closure_op_%p_%d", f, len(f.builder.nodes))
+	milDType, err := gomlxDTypeToMIL(outputShape.DType)
+	if err != nil {
+		return nil, err
+	}
+	milShape := make([]int64, outputShape.Rank())
+	for i := 0; i < outputShape.Rank(); i++ {
+		milShape[i] = int64(outputShape.Dimensions[i])
+	}
+	return f.builder.milBuilder.PlaceholderValue(placeholderName, milDType, milShape...), nil
+}
+
 // addUnaryOp is a helper that adds a unary operation to the computation graph.
 func (f *Function) addUnaryOp(
 	opType backends.OpType,
@@ -2712,5 +2729,570 @@ func (f *Function) ReduceWindow(
 	// Create a new node with the result
 	node := f.builder.newNode(opType, outputShape, resultValue, operand)
 
+	return node, nil
+}
+
+//======================================================================================================================
+// Logical and Classification Operations
+//======================================================================================================================
+
+// Identity returns an Op whose output is the same as its input.
+// It's a no-op that can serve as a place-holder.
+func (f *Function) Identity(x backends.Value) (backends.Value, error) {
+	opType := backends.OpTypeIdentity
+	inputs, err := f.builder.checkOps(opType.String(), x)
+	if err != nil {
+		return nil, err
+	}
+	operand := inputs[0]
+
+	// Identity is a no-op - the output shape and dtype are the same as input
+	outputShape := operand.shape
+
+	var resultValue *model.Value
+	if f.isClosureContext() {
+		// In closure context, create a placeholder value.
+		placeholderName := fmt.Sprintf("closure_op_%p_%d", f, len(f.builder.nodes))
+		resultValue = f.builder.milBuilder.PlaceholderValue(placeholderName, operand.milValue.DType(), operand.milValue.Shape()...)
+	} else {
+		// In main function context, use MIL identity operation.
+		identityName := fmt.Sprintf("identity_%d", f.builder.nextConstID)
+		f.builder.nextConstID++
+		resultValue = f.builder.milBuilder.Identity(identityName, operand.milValue)
+	}
+
+	// Create a new node with the result
+	node := f.builder.newNode(opType, outputShape, resultValue, operand)
+
+	return node, nil
+}
+
+// BroadcastInDim broadcasts x to an output with the given shape.
+// broadcastAxes has an output axes value for each x axes (len(broadcastAxes) == x.Shape.Rank()).
+// The i-th axis of x is mapped to the broadcastAxes[i]-th dimension of the output.
+func (f *Function) BroadcastInDim(x backends.Value, outputShape shapes.Shape, broadcastAxes []int) (backends.Value, error) {
+	opType := backends.OpTypeBroadcastInDim
+	inputs, err := f.builder.checkOps(opType.String(), x)
+	if err != nil {
+		return nil, err
+	}
+	operand := inputs[0]
+
+	// Validate broadcast axes length
+	if len(broadcastAxes) != operand.shape.Rank() {
+		return nil, errors.Errorf("BroadcastInDim: broadcastAxes length (%d) must match input rank (%d)",
+			len(broadcastAxes), operand.shape.Rank())
+	}
+
+	// Validate broadcast axes bounds and dimension compatibility
+	for i, outAxis := range broadcastAxes {
+		if outAxis < 0 || outAxis >= outputShape.Rank() {
+			return nil, errors.Errorf("BroadcastInDim: broadcastAxes[%d]=%d out of bounds [0, %d)",
+				i, outAxis, outputShape.Rank())
+		}
+		inputDim := operand.shape.Dimensions[i]
+		outputDim := outputShape.Dimensions[outAxis]
+		if inputDim != outputDim && inputDim != 1 {
+			return nil, errors.Errorf("BroadcastInDim: dimension mismatch at broadcastAxes[%d]=%d: input dim=%d, output dim=%d (must be equal or input=1)",
+				i, outAxis, inputDim, outputDim)
+		}
+	}
+
+	// Convert output shape dimensions to int64
+	milOutShape := make([]int64, outputShape.Rank())
+	for i := 0; i < outputShape.Rank(); i++ {
+		milOutShape[i] = int64(outputShape.Dimensions[i])
+	}
+
+	var resultValue *model.Value
+	if f.isClosureContext() {
+		resultValue, err = f.closurePlaceholder(outputShape)
+		if err != nil {
+			return nil, errors.Wrap(err, "BroadcastInDim")
+		}
+	} else {
+		// CoreML MIL doesn't have a direct broadcast_in_dim operation.
+		// We need to compose it using reshape and tile operations.
+		//
+		// Strategy:
+		// 1. First, expand dims to match the target rank by inserting size-1 dimensions
+		// 2. Then use tile to broadcast the size-1 dimensions to the target size
+
+		// Step 1: Build the intermediate shape after expanding dimensions
+		// The intermediate shape has the same rank as output, with:
+		// - Dimensions from input placed at positions specified by broadcastAxes
+		// - Size 1 at all other positions
+		intermediateShape := make([]int64, outputShape.Rank())
+		for i := range intermediateShape {
+			intermediateShape[i] = 1
+		}
+		for i, outAxis := range broadcastAxes {
+			intermediateShape[outAxis] = int64(operand.shape.Dimensions[i])
+		}
+
+		// Reshape input to intermediate shape
+		reshaped := f.builder.milBuilder.Reshape(operand.milValue, intermediateShape)
+
+		// Step 2: Compute tile repetitions
+		reps := make([]int64, outputShape.Rank())
+		for i := 0; i < outputShape.Rank(); i++ {
+			if intermediateShape[i] == 1 {
+				reps[i] = milOutShape[i]
+			} else {
+				reps[i] = 1
+			}
+		}
+
+		// Check if we need to tile at all
+		needTile := false
+		for _, r := range reps {
+			if r > 1 {
+				needTile = true
+				break
+			}
+		}
+
+		if needTile {
+			resultValue = f.builder.milBuilder.Tile(reshaped, reps)
+		} else {
+			resultValue = reshaped
+		}
+	}
+
+	// Create a new node with the result
+	node := f.builder.newNode(opType, outputShape, resultValue, operand)
+
+	return node, nil
+}
+
+// Clamp returns the element-wise clamping operation.
+// The values max and min can either be a scalar or have the same shape as x.
+func (f *Function) Clamp(min, x, max backends.Value) (backends.Value, error) {
+	opType := backends.OpTypeClamp
+	inputs, err := f.builder.checkOps(opType.String(), min, x, max)
+	if err != nil {
+		return nil, err
+	}
+	minNode, xNode, maxNode := inputs[0], inputs[1], inputs[2]
+
+	// Output shape follows broadcasting rules for all three operands
+	// First broadcast x with min, then result with max
+	outputShape, err := shapeinference.BinaryOp(backends.OpTypeMax, xNode.shape, minNode.shape)
+	if err != nil {
+		return nil, errors.Wrap(err, "Clamp: broadcasting x with min")
+	}
+	outputShape, err = shapeinference.BinaryOp(backends.OpTypeMin, outputShape, maxNode.shape)
+	if err != nil {
+		return nil, errors.Wrap(err, "Clamp: broadcasting result with max")
+	}
+
+	var resultValue *model.Value
+	if f.isClosureContext() {
+		resultValue, err = f.closurePlaceholder(outputShape)
+		if err != nil {
+			return nil, errors.Wrap(err, "Clamp")
+		}
+	} else {
+		// Use MIL Clip operation
+		resultValue = f.builder.milBuilder.Clip(xNode.milValue, minNode.milValue, maxNode.milValue)
+	}
+
+	// Create a new node with the result
+	node := f.builder.newNode(opType, outputShape, resultValue, minNode, xNode, maxNode)
+
+	return node, nil
+}
+
+// LogicalAnd returns the element-wise logical AND operation.
+func (f *Function) LogicalAnd(lhs, rhs backends.Value) (backends.Value, error) {
+	opType := backends.OpTypeLogicalAnd
+	inputs, err := f.builder.checkOps(opType.String(), lhs, rhs)
+	if err != nil {
+		return nil, err
+	}
+	lhsNode, rhsNode := inputs[0], inputs[1]
+
+	// Output shape follows broadcasting rules, dtype is Bool
+	outputShape, err := shapeinference.BinaryOp(opType, lhsNode.shape, rhsNode.shape)
+	if err != nil {
+		return nil, err
+	}
+	// Logical operations always return Bool
+	outputShape = shapes.Make(dtypes.Bool, outputShape.Dimensions...)
+
+	var resultValue *model.Value
+	if f.isClosureContext() {
+		resultValue, err = f.closurePlaceholder(outputShape)
+		if err != nil {
+			return nil, errors.Wrap(err, "LogicalAnd")
+		}
+	} else {
+		resultValue = f.builder.milBuilder.LogicalAnd(lhsNode.milValue, rhsNode.milValue)
+	}
+
+	node := f.builder.newNode(opType, outputShape, resultValue, lhsNode, rhsNode)
+	return node, nil
+}
+
+// LogicalOr returns the element-wise logical OR operation.
+func (f *Function) LogicalOr(lhs, rhs backends.Value) (backends.Value, error) {
+	opType := backends.OpTypeLogicalOr
+	inputs, err := f.builder.checkOps(opType.String(), lhs, rhs)
+	if err != nil {
+		return nil, err
+	}
+	lhsNode, rhsNode := inputs[0], inputs[1]
+
+	// Output shape follows broadcasting rules, dtype is Bool
+	outputShape, err := shapeinference.BinaryOp(opType, lhsNode.shape, rhsNode.shape)
+	if err != nil {
+		return nil, err
+	}
+	outputShape = shapes.Make(dtypes.Bool, outputShape.Dimensions...)
+
+	var resultValue *model.Value
+	if f.isClosureContext() {
+		resultValue, err = f.closurePlaceholder(outputShape)
+		if err != nil {
+			return nil, errors.Wrap(err, "LogicalOr")
+		}
+	} else {
+		resultValue = f.builder.milBuilder.LogicalOr(lhsNode.milValue, rhsNode.milValue)
+	}
+
+	node := f.builder.newNode(opType, outputShape, resultValue, lhsNode, rhsNode)
+	return node, nil
+}
+
+// LogicalNot returns the element-wise logical NOT operation.
+func (f *Function) LogicalNot(x backends.Value) (backends.Value, error) {
+	opType := backends.OpTypeLogicalNot
+	inputs, err := f.builder.checkOps(opType.String(), x)
+	if err != nil {
+		return nil, err
+	}
+	operand := inputs[0]
+
+	// Output shape is same as input, dtype is Bool
+	outputShape := shapes.Make(dtypes.Bool, operand.shape.Dimensions...)
+
+	var resultValue *model.Value
+	if f.isClosureContext() {
+		resultValue, err = f.closurePlaceholder(outputShape)
+		if err != nil {
+			return nil, errors.Wrap(err, "LogicalNot")
+		}
+	} else {
+		resultValue = f.builder.milBuilder.LogicalNot(operand.milValue)
+	}
+
+	node := f.builder.newNode(opType, outputShape, resultValue, operand)
+	return node, nil
+}
+
+// LogicalXor returns the element-wise logical XOR operator.
+func (f *Function) LogicalXor(lhs, rhs backends.Value) (backends.Value, error) {
+	opType := backends.OpTypeLogicalXor
+	inputs, err := f.builder.checkOps(opType.String(), lhs, rhs)
+	if err != nil {
+		return nil, err
+	}
+	lhsNode, rhsNode := inputs[0], inputs[1]
+
+	// Output shape follows broadcasting rules, dtype is Bool
+	outputShape, err := shapeinference.BinaryOp(opType, lhsNode.shape, rhsNode.shape)
+	if err != nil {
+		return nil, err
+	}
+	outputShape = shapes.Make(dtypes.Bool, outputShape.Dimensions...)
+
+	var resultValue *model.Value
+	if f.isClosureContext() {
+		resultValue, err = f.closurePlaceholder(outputShape)
+		if err != nil {
+			return nil, errors.Wrap(err, "LogicalXor")
+		}
+	} else {
+		resultValue = f.builder.milBuilder.LogicalXor(lhsNode.milValue, rhsNode.milValue)
+	}
+
+	node := f.builder.newNode(opType, outputShape, resultValue, lhsNode, rhsNode)
+	return node, nil
+}
+
+// IsFinite tests whether each element of operand is finite.
+// Returns boolean values where each element is true if and only if the corresponding input element is finite.
+func (f *Function) IsFinite(x backends.Value) (backends.Value, error) {
+	opType := backends.OpTypeIsFinite
+	inputs, err := f.builder.checkOps(opType.String(), x)
+	if err != nil {
+		return nil, err
+	}
+	operand := inputs[0]
+
+	// Output shape is same as input, dtype is Bool
+	outputShape := shapes.Make(dtypes.Bool, operand.shape.Dimensions...)
+
+	var resultValue *model.Value
+	if f.isClosureContext() {
+		resultValue, err = f.closurePlaceholder(outputShape)
+		if err != nil {
+			return nil, errors.Wrap(err, "IsFinite")
+		}
+	} else {
+		resultValue = f.builder.milBuilder.IsFinite(operand.milValue)
+	}
+
+	node := f.builder.newNode(opType, outputShape, resultValue, operand)
+	return node, nil
+}
+
+// IsNaN tests whether each element of operand is NaN.
+func (f *Function) IsNaN(x backends.Value) (backends.Value, error) {
+	opType := backends.OpTypeIsNaN
+	inputs, err := f.builder.checkOps(opType.String(), x)
+	if err != nil {
+		return nil, err
+	}
+	operand := inputs[0]
+
+	// Output shape is same as input, dtype is Bool
+	outputShape := shapes.Make(dtypes.Bool, operand.shape.Dimensions...)
+
+	var resultValue *model.Value
+	if f.isClosureContext() {
+		resultValue, err = f.closurePlaceholder(outputShape)
+		if err != nil {
+			return nil, errors.Wrap(err, "IsNaN")
+		}
+	} else {
+		resultValue = f.builder.milBuilder.IsNan(operand.milValue)
+	}
+
+	node := f.builder.newNode(opType, outputShape, resultValue, operand)
+	return node, nil
+}
+
+// DynamicSlice extracts a slice from the operand at the startIndices position and the given sliceSizes.
+func (f *Function) DynamicSlice(operand backends.Value, startIndices []backends.Value, sliceDims []int) (backends.Value, error) {
+	opType := backends.OpTypeDynamicSlice
+	inputs, err := f.builder.checkOps(opType.String(), operand)
+	if err != nil {
+		return nil, err
+	}
+	operandNode := inputs[0]
+
+	// Validate inputs
+	if len(startIndices) != operandNode.shape.Rank() {
+		return nil, errors.Errorf("DynamicSlice: startIndices length (%d) must match operand rank (%d)",
+			len(startIndices), operandNode.shape.Rank())
+	}
+	if len(sliceDims) != operandNode.shape.Rank() {
+		return nil, errors.Errorf("DynamicSlice: sliceDims length (%d) must match operand rank (%d)",
+			len(sliceDims), operandNode.shape.Rank())
+	}
+
+	// Collect and validate start index nodes
+	startNodes := make([]*Node, len(startIndices))
+	for i, idx := range startIndices {
+		idxInputs, err := f.builder.checkOps(opType.String(), idx)
+		if err != nil {
+			return nil, err
+		}
+		startNodes[i] = idxInputs[0]
+		// Validate that start indices are scalar or rank-1 with size 1
+		idxShape := startNodes[i].shape
+		if idxShape.Rank() > 1 || (idxShape.Rank() == 1 && idxShape.Dimensions[0] != 1) {
+			return nil, errors.Errorf("DynamicSlice: startIndices[%d] must be scalar or rank-1 with size 1, got shape %v",
+				i, idxShape.Dimensions)
+		}
+	}
+
+	// Output shape is determined by sliceDims
+	outputShape := shapes.Make(operandNode.shape.DType, sliceDims...)
+
+	var resultValue *model.Value
+	if f.isClosureContext() {
+		resultValue, err = f.closurePlaceholder(outputShape)
+		if err != nil {
+			return nil, errors.Wrap(err, "DynamicSlice")
+		}
+	} else {
+		// Use MIL SliceBySize operation
+		// First, stack the start indices into a single tensor
+		milSliceSizes := make([]int64, len(sliceDims))
+		for i, s := range sliceDims {
+			milSliceSizes[i] = int64(s)
+		}
+
+		// Concatenate start indices into a 1D tensor [rank]
+		startMilValues := make([]*model.Value, len(startNodes))
+		for i, node := range startNodes {
+			startMilValues[i] = node.milValue
+		}
+
+		// Stack the scalar indices into a 1D tensor using concat
+		var beginTensor *model.Value
+		if len(startMilValues) == 1 {
+			// Single dimension case - reshape scalar to [1]
+			beginTensor = f.builder.milBuilder.Reshape(startMilValues[0], []int64{1})
+		} else {
+			// Multiple dimensions - reshape each to [1] and concatenate
+			reshapedIndices := make([]*model.Value, len(startMilValues))
+			for i, v := range startMilValues {
+				reshapedIndices[i] = f.builder.milBuilder.Reshape(v, []int64{1})
+			}
+			beginTensor = f.builder.milBuilder.Concat(reshapedIndices, 0)
+		}
+
+		resultValue = f.builder.milBuilder.SliceBySize(operandNode.milValue, beginTensor, milSliceSizes)
+	}
+
+	// Collect all input nodes for the graph
+	allInputs := make([]*Node, 1+len(startNodes))
+	allInputs[0] = operandNode
+	copy(allInputs[1:], startNodes)
+
+	node := f.builder.newNode(opType, outputShape, resultValue, allInputs...)
+	return node, nil
+}
+
+//======================================================================================================================
+// Normalization and Arithmetic Operations
+//======================================================================================================================
+
+// BatchNormForInference implements batch normalization for inference.
+// The operand is normalized along the featureAxis using the given mean, variance, scale, and offset.
+// scale, offset, mean, and variance must be 1D tensors with size equal to operand.shape[featureAxis].
+func (f *Function) BatchNormForInference(operand, scale, offset, mean, variance backends.Value, epsilon float32, featureAxis int) (backends.Value, error) {
+	opType := backends.OpTypeBatchNormForInference
+	inputs, err := f.builder.checkOps(opType.String(), operand, scale, offset, mean, variance)
+	if err != nil {
+		return nil, err
+	}
+	operandNode := inputs[0]
+	scaleNode := inputs[1]
+	offsetNode := inputs[2]
+	meanNode := inputs[3]
+	varianceNode := inputs[4]
+
+	// Output shape is the same as operand
+	outputShape := operandNode.shape
+
+	// Normalize and validate feature axis
+	if featureAxis < 0 {
+		featureAxis = operandNode.shape.Rank() + featureAxis
+	}
+	if featureAxis < 0 || featureAxis >= operandNode.shape.Rank() {
+		return nil, errors.Errorf("BatchNormForInference: featureAxis %d out of bounds for operand rank %d",
+			featureAxis, operandNode.shape.Rank())
+	}
+
+	// Validate parameter shapes
+	numFeatures := operandNode.shape.Dimensions[featureAxis]
+	paramNodes := []*Node{scaleNode, offsetNode, meanNode, varianceNode}
+	paramNames := []string{"scale", "offset", "mean", "variance"}
+	for i, paramNode := range paramNodes {
+		if paramNode.shape.Rank() != 1 || paramNode.shape.Dimensions[0] != numFeatures {
+			return nil, errors.Errorf("BatchNormForInference: %s must have shape [%d], got %v",
+				paramNames[i], numFeatures, paramNode.shape.Dimensions)
+		}
+	}
+
+	var resultValue *model.Value
+	if f.isClosureContext() {
+		resultValue, err = f.closurePlaceholder(outputShape)
+		if err != nil {
+			return nil, errors.Wrap(err, "BatchNormForInference")
+		}
+	} else {
+		// CoreML MIL batch_norm expects input in NCHW format with feature axis = 1
+		// If the feature axis is different, we need to transpose
+
+		if featureAxis == 1 {
+			// Standard NCHW format - use batch_norm directly
+			resultValue = f.builder.milBuilder.BatchNorm(
+				operandNode.milValue,
+				meanNode.milValue,
+				varianceNode.milValue,
+				scaleNode.milValue,  // gamma
+				offsetNode.milValue, // beta
+				epsilon,
+			)
+		} else {
+			// Non-standard feature axis - compose using element-wise operations
+			// BatchNorm: y = (x - mean) / sqrt(variance + epsilon) * scale + offset
+
+			// 1. Subtract mean: x - mean
+			centered := f.builder.milBuilder.Sub(operandNode.milValue, meanNode.milValue)
+
+			// 2. Compute rsqrt(variance + epsilon)
+			constName := fmt.Sprintf("bn_eps_%d", f.builder.nextConstID)
+			f.builder.nextConstID++
+			epsilonVal := f.builder.milBuilder.Const(constName, model.Float32, []int64{}, []float32{epsilon})
+			varPlusEps := f.builder.milBuilder.Add(varianceNode.milValue, epsilonVal)
+			invStd := f.builder.milBuilder.Rsqrt(varPlusEps)
+
+			// 3. Normalize: (x - mean) * rsqrt(variance + epsilon)
+			normalized := f.builder.milBuilder.Mul(centered, invStd)
+
+			// 4. Scale: normalized * scale
+			scaled := f.builder.milBuilder.Mul(normalized, scaleNode.milValue)
+
+			// 5. Offset: scaled + offset
+			resultValue = f.builder.milBuilder.Add(scaled, offsetNode.milValue)
+		}
+	}
+
+	node := f.builder.newNode(opType, outputShape, resultValue, operandNode, scaleNode, offsetNode, meanNode, varianceNode)
+	return node, nil
+}
+
+// Rem returns the remainder operation using floor division semantics.
+// This implements: lhs - floor(lhs / rhs) * rhs
+// which matches Python's % operator. The result has the same sign as rhs (the divisor).
+// For negative operands, this may differ from C/Java's % operator:
+//
+//	Rem(7, 3) = 1
+//	Rem(-7, 3) = 2 (not -1 as in C/Java)
+//	Rem(7, -3) = -2
+func (f *Function) Rem(lhs, rhs backends.Value) (backends.Value, error) {
+	opType := backends.OpTypeRem
+	inputs, err := f.builder.checkOps(opType.String(), lhs, rhs)
+	if err != nil {
+		return nil, err
+	}
+	lhsNode, rhsNode := inputs[0], inputs[1]
+
+	// Output shape follows broadcasting rules
+	outputShape, err := shapeinference.BinaryOp(opType, lhsNode.shape, rhsNode.shape)
+	if err != nil {
+		return nil, err
+	}
+
+	var resultValue *model.Value
+	if f.isClosureContext() {
+		resultValue, err = f.closurePlaceholder(outputShape)
+		if err != nil {
+			return nil, errors.Wrap(err, "Rem")
+		}
+	} else {
+		// CoreML MIL doesn't have a direct remainder operation.
+		// Compute: lhs - floor(lhs / rhs) * rhs (floor modulo)
+
+		// 1. lhs / rhs
+		quotient := f.builder.milBuilder.Div(lhsNode.milValue, rhsNode.milValue)
+
+		// 2. floor(lhs / rhs)
+		floored := f.builder.milBuilder.Floor(quotient)
+
+		// 3. floor(lhs / rhs) * rhs
+		product := f.builder.milBuilder.Mul(floored, rhsNode.milValue)
+
+		// 4. lhs - floor(lhs / rhs) * rhs
+		resultValue = f.builder.milBuilder.Sub(lhsNode.milValue, product)
+	}
+
+	node := f.builder.newNode(opType, outputShape, resultValue, lhsNode, rhsNode)
 	return node, nil
 }

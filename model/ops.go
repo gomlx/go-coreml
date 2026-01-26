@@ -1217,18 +1217,31 @@ func (b *Builder) LogicalXor(x, y *Value) *Value {
 
 // IsNan checks element-wise if values are NaN.
 // Returns Bool dtype indicating which elements are NaN.
+// Implementation: NaN is the only value not equal to itself, so isnan(x) = (x != x)
 func (b *Builder) IsNan(x *Value) *Value {
-	return b.addOp("isnan", map[string]*Value{
-		"x": x,
-	}, b.genName("isnan"), Bool, x.shape)
+	// NaN != NaN, so we use not_equal(x, x)
+	return b.NotEqual(x, x)
 }
 
 // IsFinite checks element-wise if values are finite (not NaN or Inf).
 // Returns Bool dtype indicating which elements are finite.
+// Implementation: A value is finite if it's not NaN and Inf * 0 doesn't produce NaN.
+// Since Inf * 0 = NaN and finite * 0 = 0, we check: !isnan(x) && !isnan(x * 0)
 func (b *Builder) IsFinite(x *Value) *Value {
-	return b.addOp("isfinite", map[string]*Value{
-		"x": x,
-	}, b.genName("isfinite"), Bool, x.shape)
+	// Create zero constant
+	zero := b.Const(b.genName("zero"), x.dtype, []int64{}, []float32{0.0})
+
+	// x * 0: will be NaN for Inf, 0 for finite, NaN for NaN
+	xTimesZero := b.Mul(x, zero)
+
+	// Check if x is not NaN: x == x
+	xNotNan := b.Equal(x, x)
+
+	// Check if x*0 is not NaN: (x*0) == (x*0)
+	xTimesZeroNotNan := b.Equal(xTimesZero, xTimesZero)
+
+	// isfinite = !isnan(x) && !isnan(x*0)
+	return b.LogicalAnd(xNotNan, xTimesZeroNotNan)
 }
 
 // Range1D generates a 1D tensor of values from start to end (exclusive) with given step.
@@ -1530,16 +1543,12 @@ func (b *Builder) Concat(values []*Value, axis int64) *Value {
 // minVal: Minimum value (can be a tensor or scalar).
 // maxVal: Maximum value (can be a tensor or scalar).
 // Output: x clamped to [minVal, maxVal].
+// Implementation: clamp(x, min, max) = minimum(maximum(x, min), max)
 func (b *Builder) Clip(x, minVal, maxVal *Value) *Value {
-	// Compute output shape based on broadcasting
-	outShape := broadcastShape(x.shape, minVal.shape)
-	outShape = broadcastShape(outShape, maxVal.shape)
-
-	return b.addOp("clip", map[string]*Value{
-		"x":   x,
-		"min": minVal,
-		"max": maxVal,
-	}, b.genName("clip"), x.dtype, outShape)
+	// First apply the lower bound: max(x, minVal)
+	lowerBounded := b.Maximum(x, minVal)
+	// Then apply the upper bound: min(lowerBounded, maxVal)
+	return b.Minimum(lowerBounded, maxVal)
 }
 
 // Cast converts a tensor to a different dtype.
