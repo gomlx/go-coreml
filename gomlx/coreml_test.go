@@ -890,8 +890,8 @@ func TestReshapeFlatten(t *testing.T) {
 	}
 }
 
-// TestBroadcastInDim tests the BroadcastInDim operation.
-func TestBroadcastInDim(t *testing.T) {
+// TestBroadcastInDimShapes tests the BroadcastInDim operation across various shape combinations.
+func TestBroadcastInDimShapes(t *testing.T) {
 	backend, err := New("")
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
@@ -1965,25 +1965,62 @@ func TestInt64ConstantConvertedToInt32InMIL(t *testing.T) {
 	}
 }
 
-// TestInt64ConstantLargeValuesError verifies that int64 constants with
-// values outside int32 range return an error (since CoreML requires Int32).
-func TestInt64ConstantLargeValuesError(t *testing.T) {
+// TestInt64ConstantLargeValuesClamp verifies that int64 constants with
+// values outside int32 range are clamped to [MinInt32, MaxInt32] rather than
+// returning an error. This is safe for ML models where out-of-range Int64
+// constants are typically attention mask sentinel values where the exact
+// magnitude doesn't matter.
+func TestInt64ConstantLargeValuesClamp(t *testing.T) {
 	backend, err := New("")
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
 	defer backend.Finalize()
 
-	builder := backend.Builder("test_int64_large_error")
+	builder := backend.Builder("test_int64_large_clamp")
 	mainFn := builder.Main()
 
-	// Create an int64 constant with a value outside int32 range
-	largeValue := int64(3_000_000_000) // > MaxInt32 (2,147,483,647)
+	// Create an int64 constant with a value outside int32 range.
+	// The value 3_000_000_000 exceeds MaxInt32 (2,147,483,647) and should
+	// be clamped to MaxInt32 during the Int64→Int32 conversion.
+	largeValue := int64(3_000_000_000)
 	int64Data := []int64{largeValue}
-	_, err = mainFn.Constant(int64Data, 1)
+	constant, err := mainFn.Constant(int64Data, 1)
+	if err != nil {
+		t.Fatalf("Constant([]int64{3B}) failed: %v — expected clamping, not an error", err)
+	}
 
-	// Should fail because the value doesn't fit in Int32
-	if err == nil {
-		t.Error("Expected error for Int64 constant with value exceeding Int32 range")
+	// Convert to float32 for output verification
+	floatOut, err := mainFn.ConvertDType(constant, dtypes.Float32)
+	if err != nil {
+		t.Fatalf("ConvertDType() failed: %v", err)
+	}
+
+	err = mainFn.Return([]backends.Value{floatOut}, nil)
+	if err != nil {
+		t.Fatalf("Return() failed: %v", err)
+	}
+
+	exec, err := builder.Compile()
+	if err != nil {
+		t.Fatalf("Compile() failed: %v", err)
+	}
+	defer exec.Finalize()
+
+	outputs, err := exec.Execute(nil, nil, 0)
+	if err != nil {
+		t.Fatalf("Execute() failed: %v", err)
+	}
+
+	outputData := make([]float32, 1)
+	err = backend.BufferToFlatData(outputs[0], outputData)
+	if err != nil {
+		t.Fatalf("BufferToFlatData() failed: %v", err)
+	}
+
+	// The clamped value should be math.MaxInt32 (2,147,483,647)
+	expected := float32(math.MaxInt32)
+	if outputData[0] != expected {
+		t.Errorf("clamped value = %f, want %f (math.MaxInt32)", outputData[0], expected)
 	}
 }
