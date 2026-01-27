@@ -890,8 +890,8 @@ func TestReshapeFlatten(t *testing.T) {
 	}
 }
 
-// TestBroadcastInDim tests the BroadcastInDim operation.
-func TestBroadcastInDim(t *testing.T) {
+// TestBroadcastInDimShapes tests the BroadcastInDim operation across various shape combinations.
+func TestBroadcastInDimShapes(t *testing.T) {
 	backend, err := New("")
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)

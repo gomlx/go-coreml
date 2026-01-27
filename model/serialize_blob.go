@@ -25,6 +25,13 @@ type BlobSerializeOptions struct {
 	// BlobThreshold is the minimum tensor size (bytes) to use blob storage.
 	// Tensors smaller than this are kept inline. Default: 1024 bytes.
 	BlobThreshold int64
+
+	// SharedWeightsPath, when set, causes SaveMLPackageWithBlobs to symlink
+	// weight.bin to this path instead of writing a new one. A null blob writer
+	// is used to compute correct protobuf offsets without performing I/O.
+	// The file at SharedWeightsPath must have been written by a prior call
+	// to SaveMLPackageWithBlobs for the same model (same weights, same order).
+	SharedWeightsPath string
 }
 
 // DefaultBlobOptions returns default blob serialization options.
@@ -38,6 +45,10 @@ func DefaultBlobOptions() BlobSerializeOptions {
 
 // SaveMLPackageWithBlobs saves a Model to an .mlpackage directory with blob storage.
 // Large tensors are stored in an external weight.bin file for efficient loading.
+//
+// When opts.SharedWeightsPath is set, the weight.bin is symlinked from the
+// shared location instead of being written anew. A null blob writer computes
+// the correct protobuf offsets without disk I/O.
 func SaveMLPackageWithBlobs(model *spec.Model, path string, opts BlobSerializeOptions) error {
 	if !opts.UseBlobStorage {
 		// Fall back to regular serialization
@@ -59,11 +70,19 @@ func SaveMLPackageWithBlobs(model *spec.Model, path string, opts BlobSerializeOp
 		return err
 	}
 
-	// Create blob writer
 	blobPath := filepath.Join(weightsDir, "weight.bin")
-	blobWriter, err := blob.NewWriter(blobPath)
-	if err != nil {
-		return fmt.Errorf("create blob writer: %w", err)
+
+	var blobWriter *blob.Writer
+	if opts.SharedWeightsPath != "" {
+		// Shared weights: use a null writer for offset computation only,
+		// then symlink to the existing weight.bin.
+		blobWriter = blob.NewNullWriter()
+	} else {
+		var err error
+		blobWriter, err = blob.NewWriter(blobPath)
+		if err != nil {
+			return fmt.Errorf("create blob writer: %w", err)
+		}
 	}
 
 	// Walk program and extract large tensors to blob file
@@ -72,9 +91,16 @@ func SaveMLPackageWithBlobs(model *spec.Model, path string, opts BlobSerializeOp
 		return fmt.Errorf("extract tensors to blob: %w", err)
 	}
 
-	// Close blob writer
+	// Close blob writer (no-op for null writer)
 	if err := blobWriter.Close(); err != nil {
 		return fmt.Errorf("close blob writer: %w", err)
+	}
+
+	// Create symlink for shared weights
+	if opts.SharedWeightsPath != "" && blobWriter.EntryCount() > 0 {
+		if err := os.Symlink(opts.SharedWeightsPath, blobPath); err != nil {
+			return fmt.Errorf("symlink shared weights: %w", err)
+		}
 	}
 
 	// Write model and manifest

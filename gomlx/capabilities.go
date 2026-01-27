@@ -15,6 +15,13 @@ var Capabilities = backends.Capabilities{
 	// Functions indicates support for the new function/closure interface.
 	Functions: true,
 
+	// PreferConstantsForVariables enables embedding model weights as constants in the
+	// computation graph. This is critical for CoreML performance because:
+	// 1. Constants can be stored in blob files (weight.bin) and memory-mapped
+	// 2. Avoids passing hundreds of weight tensors as inputs per inference
+	// 3. Enables CoreML to optimize the model with known weight values
+	PreferConstantsForVariables: true,
+
 	Operations: map[backends.OpType]bool{
 		// Graph inputs (leaf nodes)
 		backends.OpTypeParameter: true,

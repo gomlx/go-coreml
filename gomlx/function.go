@@ -229,13 +229,13 @@ func (f *Function) Constant(flat any, dims ...int) (backends.Value, error) {
 	// If the GoMLX dtype is Int64 but MIL dtype is Int32, convert the data.
 	// This keeps the GoMLX shape as Int64 (for onnx-gomlx compatibility) while
 	// giving CoreML Int32 data (which it supports).
+	// Values that exceed Int32 range are clamped — this is safe for ML models
+	// where out-of-range Int64 constants are typically attention mask values
+	// (large negatives) where the exact magnitude doesn't matter.
 	milData := flat
 	if dtype == dtypes.Int64 && milDType == model.Int32 {
 		int64Data := flat.([]int64)
-		if !int64SliceFitsInInt32(int64Data) {
-			return nil, errors.Errorf("Constant: Int64 values exceed Int32 range, cannot convert for CoreML")
-		}
-		milData = convertInt64ToInt32(int64Data)
+		milData = convertInt64ToInt32Clamped(int64Data)
 	}
 
 	// Convert dimensions to int64

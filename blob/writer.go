@@ -46,6 +46,18 @@ func NewWriter(path string) (*Writer, error) {
 	return w, nil
 }
 
+// NewNullWriter creates a writer that computes offsets without writing to disk.
+// Used when sharing weight.bin across multiple compilations — the protobuf is
+// mutated to reference BlobFileValue offsets, but no data is written because
+// the actual weight.bin is symlinked from a shared location.
+func NewNullWriter() *Writer {
+	return &Writer{
+		offset:  DefaultAlignment,
+		entries: nil,
+		// file is nil — AddBlob tracks offsets but doesn't write
+	}
+}
+
 // AddBlob adds a blob to the file and returns the metadata offset.
 // This offset should be stored in BlobFileValue.offset in the protobuf.
 func (w *Writer) AddBlob(dtype DataType, data []byte) (uint64, error) {
