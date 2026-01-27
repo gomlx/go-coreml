@@ -84,6 +84,46 @@ func (f *Function) Closure() (backends.Function, error) {
 	return closure, nil
 }
 
+// sanitizeName converts a name to a valid CoreML identifier.
+// CoreML identifiers must match: [A-Za-z\_][A-Za-z0-9\_@]*
+// This function replaces invalid characters with underscores and ensures
+// the name starts with a letter or underscore.
+func sanitizeName(name string) string {
+	if name == "" {
+		return "_empty_"
+	}
+
+	result := make([]byte, 0, len(name))
+	for i, c := range name {
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '@' {
+			result = append(result, byte(c))
+		} else if c >= '0' && c <= '9' {
+			if i == 0 {
+				// Can't start with a digit, prepend underscore
+				result = append(result, '_')
+			}
+			result = append(result, byte(c))
+		} else {
+			// Replace invalid character with underscore
+			result = append(result, '_')
+		}
+	}
+
+	// Ensure we have at least one character
+	if len(result) == 0 {
+		return "_sanitized_"
+	}
+
+	// Ensure first character is valid (letter or underscore)
+	if result[0] != '_' && result[0] != '@' &&
+		!(result[0] >= 'A' && result[0] <= 'Z') &&
+		!(result[0] >= 'a' && result[0] <= 'z') {
+		result = append([]byte{'_'}, result...)
+	}
+
+	return string(result)
+}
+
 // Parameter creates an input parameter for this function.
 func (f *Function) Parameter(name string, shape shapes.Shape, sharding *backends.ShardingSpec) (backends.Value, error) {
 	if err := f.CheckValid(); err != nil {
@@ -103,6 +143,9 @@ func (f *Function) Parameter(name string, shape shapes.Shape, sharding *backends
 			notimplemented.NotImplementedError,
 			"sharding spec %+v not supported for %q builder", sharding, BackendName)
 	}
+
+	// Sanitize the name to be a valid CoreML identifier
+	sanitizedName := sanitizeName(name)
 
 	// Convert GoMLX dtype to CoreML dtype
 	milDType, err := gomlxDTypeToMIL(shape.DType)
@@ -126,7 +169,7 @@ func (f *Function) Parameter(name string, shape shapes.Shape, sharding *backends
 		// For closures, create a placeholder value that is NOT added as a model input.
 		// The actual block input will be created during replayClosureInBlock.
 		// We use a unique name to avoid conflicts.
-		closureParamName := fmt.Sprintf("closure_%p_param_%s", f, name)
+		closureParamName := fmt.Sprintf("closure_%p_param_%s", f, sanitizedName)
 		milValue = f.builder.milBuilder.PlaceholderValue(closureParamName, milDType, dims...)
 		node = f.builder.newNode(backends.OpTypeParameter, shape, milValue)
 		f.builder.nodeMap[node] = milValue
@@ -135,13 +178,14 @@ func (f *Function) Parameter(name string, shape shapes.Shape, sharding *backends
 		// because closure parameters are not model-level inputs
 	} else {
 		// For the main function, create a proper model input
-		milValue = f.builder.milBuilder.Input(name, milDType, dims...)
+		// Use sanitized name for CoreML compatibility
+		milValue = f.builder.milBuilder.Input(sanitizedName, milDType, dims...)
 		node = f.builder.newNode(backends.OpTypeParameter, shape, milValue)
 		f.builder.inputs = append(f.builder.inputs, node)
 		f.builder.nodeMap[node] = milValue
 		f.parameters = append(f.parameters, node)
-		// Track input metadata for model-level inputs only
-		f.builder.inputNames = append(f.builder.inputNames, name)
+		// Track input metadata for model-level inputs only (use sanitized name)
+		f.builder.inputNames = append(f.builder.inputNames, sanitizedName)
 		f.builder.inputShapes = append(f.builder.inputShapes, shape)
 	}
 
@@ -176,10 +220,22 @@ func (f *Function) Constant(flat any, dims ...int) (backends.Value, error) {
 		)
 	}
 
-	// Convert to MIL dtype
+	// Convert to MIL dtype (note: Int64 maps to Int32 for CoreML compatibility)
 	milDType, err := gomlxDTypeToMIL(dtype)
 	if err != nil {
 		return nil, errors.Wrap(err, "Constant")
+	}
+
+	// If the GoMLX dtype is Int64 but MIL dtype is Int32, convert the data.
+	// This keeps the GoMLX shape as Int64 (for onnx-gomlx compatibility) while
+	// giving CoreML Int32 data (which it supports).
+	milData := flat
+	if dtype == dtypes.Int64 && milDType == model.Int32 {
+		int64Data := flat.([]int64)
+		if !int64SliceFitsInInt32(int64Data) {
+			return nil, errors.Errorf("Constant: Int64 values exceed Int32 range, cannot convert for CoreML")
+		}
+		milData = convertInt64ToInt32(int64Data)
 	}
 
 	// Convert dimensions to int64
@@ -193,7 +249,7 @@ func (f *Function) Constant(flat any, dims ...int) (backends.Value, error) {
 	f.builder.nextConstID++
 
 	// Create constant in MIL builder
-	milValue := f.builder.milBuilder.Const(constName, milDType, milShape, flat)
+	milValue := f.builder.milBuilder.Const(constName, milDType, milShape, milData)
 
 	// Create node
 	node := f.builder.newNode(backends.OpTypeConstant, shape, milValue)
@@ -393,8 +449,24 @@ func (f *Function) addBinaryOp(
 	}
 	lhsNode, rhsNode := inputs[0], inputs[1]
 
+	// Handle dtype mismatch between Int32 and Int64 at the GoMLX level.
+	// Since CoreML maps Int64→Int32, both MIL values are Int32, but GoMLX shapes
+	// might differ. Unify to Int64 for shape inference (the actual MIL ops use Int32).
+	lhsValue := lhsNode.milValue
+	rhsValue := rhsNode.milValue
+	lhsShape := lhsNode.shape
+	rhsShape := rhsNode.shape
+
+	if lhsShape.DType == dtypes.Int32 && rhsShape.DType == dtypes.Int64 {
+		// Promote LHS shape to Int64 for shape inference (MIL values are already both Int32)
+		lhsShape = shapes.Make(dtypes.Int64, lhsShape.Dimensions...)
+	} else if lhsShape.DType == dtypes.Int64 && rhsShape.DType == dtypes.Int32 {
+		// Promote RHS shape to Int64 for shape inference (MIL values are already both Int32)
+		rhsShape = shapes.Make(dtypes.Int64, rhsShape.Dimensions...)
+	}
+
 	// Compute output shape using shapeinference
-	outputShape, err := shapeinference.BinaryOp(opType, lhsNode.shape, rhsNode.shape)
+	outputShape, err := shapeinference.BinaryOp(opType, lhsShape, rhsShape)
 	if err != nil {
 		return nil, err
 	}
@@ -412,8 +484,6 @@ func (f *Function) addBinaryOp(
 		resultValue = f.builder.milBuilder.PlaceholderValue(placeholderName, milDType, milShape...)
 	} else {
 		// In main function context, build the MIL operation directly.
-		lhsValue := lhsNode.milValue
-		rhsValue := rhsNode.milValue
 		resultValue = milOp(lhsValue, rhsValue)
 	}
 
@@ -435,8 +505,24 @@ func (f *Function) addComparisonOp(
 	}
 	lhsNode, rhsNode := inputs[0], inputs[1]
 
+	// Handle dtype mismatch between Int32 and Int64 at the GoMLX level.
+	// Since CoreML maps Int64→Int32, both MIL values are Int32, but GoMLX shapes
+	// might differ. Unify to Int64 for shape inference (the actual MIL ops use Int32).
+	lhsValue := lhsNode.milValue
+	rhsValue := rhsNode.milValue
+	lhsShape := lhsNode.shape
+	rhsShape := rhsNode.shape
+
+	if lhsShape.DType == dtypes.Int32 && rhsShape.DType == dtypes.Int64 {
+		// Promote LHS shape to Int64 for shape inference (MIL values are already both Int32)
+		lhsShape = shapes.Make(dtypes.Int64, lhsShape.Dimensions...)
+	} else if lhsShape.DType == dtypes.Int64 && rhsShape.DType == dtypes.Int32 {
+		// Promote RHS shape to Int64 for shape inference (MIL values are already both Int32)
+		rhsShape = shapes.Make(dtypes.Int64, rhsShape.Dimensions...)
+	}
+
 	// Compute output shape using shapeinference.ComparisonOp
-	outputShape, err := shapeinference.ComparisonOp(opType, lhsNode.shape, rhsNode.shape)
+	outputShape, err := shapeinference.ComparisonOp(opType, lhsShape, rhsShape)
 	if err != nil {
 		return nil, err
 	}
@@ -454,8 +540,6 @@ func (f *Function) addComparisonOp(
 		resultValue = f.builder.milBuilder.PlaceholderValue(placeholderName, milDType, milShape...)
 	} else {
 		// In main function context, build the MIL operation directly.
-		lhsValue := lhsNode.milValue
-		rhsValue := rhsNode.milValue
 		resultValue = milOp(lhsValue, rhsValue)
 	}
 
@@ -484,9 +568,16 @@ func (f *Function) Neg(x backends.Value) (backends.Value, error) {
 	operand := inputs[0]
 
 	// Create a constant -1 for multiplication (scalar broadcasts)
+	// Always use Float32 for the constant data, then cast to operand's dtype if needed
 	constName := fmt.Sprintf("neg_one_%d", f.builder.nextConstID)
 	f.builder.nextConstID++
-	negOne := f.builder.milBuilder.Const(constName, operand.milValue.DType(), []int64{}, []float32{-1.0})
+	negOne := f.builder.milBuilder.Const(constName, model.Float32, []int64{}, []float32{-1.0})
+
+	// Cast to operand's dtype if it's not Float32
+	operandDType := operand.milValue.DType()
+	if operandDType != model.Float32 {
+		negOne = f.builder.milBuilder.Cast(negOne, operandDType)
+	}
 
 	// Multiply by -1 to negate
 	resultValue := f.builder.milBuilder.Mul(operand.milValue, negOne)
@@ -575,10 +666,16 @@ func (f *Function) Expm1(x backends.Value) (backends.Value, error) {
 	// exp(x)
 	expResult := f.builder.milBuilder.Exp(operand.milValue)
 
-	// Create constant 1 with the same dtype as x
+	// Create constant 1 (always use Float32 for data, then cast if needed)
 	constName := fmt.Sprintf("expm1_one_%d", f.builder.nextConstID)
 	f.builder.nextConstID++
-	one := f.builder.milBuilder.Const(constName, operand.milValue.DType(), []int64{}, []float32{1.0})
+	one := f.builder.milBuilder.Const(constName, model.Float32, []int64{}, []float32{1.0})
+
+	// Cast to operand's dtype if it's not Float32
+	operandDType := operand.milValue.DType()
+	if operandDType != model.Float32 {
+		one = f.builder.milBuilder.Cast(one, operandDType)
+	}
 
 	// exp(x) - 1
 	resultValue := f.builder.milBuilder.Sub(expResult, one)
@@ -604,10 +701,16 @@ func (f *Function) Log1p(x backends.Value) (backends.Value, error) {
 		return nil, err
 	}
 
-	// Create constant 1 with the same dtype as x
+	// Create constant 1 (always use Float32 for data, then cast if needed)
 	constName := fmt.Sprintf("log1p_one_%d", f.builder.nextConstID)
 	f.builder.nextConstID++
-	one := f.builder.milBuilder.Const(constName, operand.milValue.DType(), []int64{}, []float32{1.0})
+	one := f.builder.milBuilder.Const(constName, model.Float32, []int64{}, []float32{1.0})
+
+	// Cast to operand's dtype if it's not Float32
+	operandDType := operand.milValue.DType()
+	if operandDType != model.Float32 {
+		one = f.builder.milBuilder.Cast(one, operandDType)
+	}
 
 	// x + 1
 	xPlusOne := f.builder.milBuilder.Add(operand.milValue, one)
@@ -2546,6 +2649,8 @@ func intsToInt64s(ints []int) []int64 {
 // ReduceWindow runs a reduction function over sliding windows.
 // CoreML supports MaxPool and AvgPool operations which correspond to ReduceOpMax and ReduceOpSum/ReduceOpProduct.
 // CoreML expects NCHW layout for input ([N, C, H, W]).
+//
+// For tensors with rank < 3, we add fake batch/channel dimensions, apply pooling, then remove them.
 func (f *Function) ReduceWindow(
 	operandOp backends.Value,
 	reductionType backends.ReduceOpType,
@@ -2574,11 +2679,6 @@ func (f *Function) ReduceWindow(
 
 	rank := operand.shape.Rank()
 
-	// CoreML pooling requires rank >= 3 (at least [N, C, spatial])
-	if rank < 3 {
-		return nil, errors.Errorf("ReduceWindow: CoreML pooling requires at least 3 dimensions (N, C, spatial), got rank %d", rank)
-	}
-
 	// Check for unsupported features
 	if baseDilations != nil {
 		for _, d := range baseDilations {
@@ -2595,6 +2695,63 @@ func (f *Function) ReduceWindow(
 		}
 	}
 
+	// CoreML pooling only supports Float32 and Float16 tensors
+	// For other dtypes, we cast to Float32, perform the pooling, then cast back
+	operandDType := operand.shape.DType
+	needsCastBack := false
+	operandValue := operand.milValue
+
+	if operandDType != dtypes.Float32 && operandDType != dtypes.Float16 {
+		// Cast to Float32 for pooling
+		operandValue = f.builder.milBuilder.Cast(operandValue, model.Float32)
+		needsCastBack = true
+	}
+
+	// CoreML pooling requires rank >= 3 (at least [N, C, spatial])
+	// For lower rank tensors, we add fake dimensions, apply pooling, then remove them
+	effectiveRank := rank
+	dimsToSqueeze := 0
+
+	if rank < 3 {
+		// Add fake dimensions to make it at least rank 3
+		// For rank 2 [A, B]: reshape to [1, A, B] (add fake N)
+		// For rank 1 [A]: reshape to [1, 1, A] (add fake N, C)
+		dimsToSqueeze = 3 - rank
+		newShape := make([]int64, 3)
+		for i := 0; i < dimsToSqueeze; i++ {
+			newShape[i] = 1
+		}
+		for i := 0; i < rank; i++ {
+			newShape[dimsToSqueeze+i] = int64(operand.shape.Dimensions[i])
+		}
+		operandValue = f.builder.milBuilder.Reshape(operandValue, newShape)
+
+		// Adjust windowDimensions, strides, paddings to account for added dimensions
+		newWindowDims := make([]int, 3)
+		newStrides := make([]int, 3)
+		newPaddings := make([][2]int, 3)
+		for i := 0; i < dimsToSqueeze; i++ {
+			newWindowDims[i] = 1
+			newStrides[i] = 1
+			newPaddings[i] = [2]int{0, 0}
+		}
+		for i := 0; i < rank; i++ {
+			newWindowDims[dimsToSqueeze+i] = windowDimensions[i]
+			if strides != nil && i < len(strides) {
+				newStrides[dimsToSqueeze+i] = strides[i]
+			} else {
+				newStrides[dimsToSqueeze+i] = windowDimensions[i]
+			}
+			if paddings != nil && i < len(paddings) {
+				newPaddings[dimsToSqueeze+i] = paddings[i]
+			}
+		}
+		windowDimensions = newWindowDims
+		strides = newStrides
+		paddings = newPaddings
+		effectiveRank = 3
+	}
+
 	// CoreML pooling operates on spatial dimensions only (assumes NCHW layout)
 	// The window must have size 1 for batch and channel dimensions
 	if len(windowDimensions) >= 2 {
@@ -2604,7 +2761,7 @@ func (f *Function) ReduceWindow(
 	}
 
 	// Extract spatial dimensions for pooling (skip batch and channel dimensions)
-	spatialRank := rank - 2
+	spatialRank := effectiveRank - 2
 	spatialWindowDims := windowDimensions[2:]
 	if len(spatialWindowDims) != spatialRank {
 		return nil, errors.Errorf("ReduceWindow: window dimensions mismatch, expected %d spatial dims, got %d", spatialRank, len(spatialWindowDims))
@@ -2661,7 +2818,7 @@ func (f *Function) ReduceWindow(
 	switch reductionType {
 	case backends.ReduceOpMax:
 		resultValue = f.builder.milBuilder.MaxPool(
-			operand.milValue,
+			operandValue,
 			milKernelSize,
 			milStrides,
 			padType,
@@ -2674,7 +2831,7 @@ func (f *Function) ReduceWindow(
 		// AvgPool computes: sum(window) / window_size
 		// So sum = AvgPool * window_size
 		avgResult := f.builder.milBuilder.AvgPool(
-			operand.milValue,
+			operandValue,
 			milKernelSize,
 			milStrides,
 			padType,
@@ -2690,9 +2847,14 @@ func (f *Function) ReduceWindow(
 		}
 
 		// Create constant for window size and multiply
+		// Always use Float32 for data, then cast if needed
 		constName := fmt.Sprintf("reduce_window_size_%d", f.builder.nextConstID)
 		f.builder.nextConstID++
-		windowSizeConst := f.builder.milBuilder.Const(constName, avgResult.DType(), []int64{}, []float32{float32(windowSize)})
+		windowSizeConst := f.builder.milBuilder.Const(constName, model.Float32, []int64{}, []float32{float32(windowSize)})
+		avgResultDType := avgResult.DType()
+		if avgResultDType != model.Float32 {
+			windowSizeConst = f.builder.milBuilder.Cast(windowSizeConst, avgResultDType)
+		}
 		resultValue = f.builder.milBuilder.Mul(avgResult, windowSizeConst)
 
 	case backends.ReduceOpMin:
@@ -2700,10 +2862,15 @@ func (f *Function) ReduceWindow(
 		// MinPool(x) = -MaxPool(-x)
 
 		// Step 1: Negate the input
+		// Always use Float32 for data, then cast if needed
 		negOneConstName := fmt.Sprintf("minpool_neg_one_%d", f.builder.nextConstID)
 		f.builder.nextConstID++
-		negOne := f.builder.milBuilder.Const(negOneConstName, operand.milValue.DType(), []int64{}, []float32{-1.0})
-		negInput := f.builder.milBuilder.Mul(operand.milValue, negOne)
+		negOne := f.builder.milBuilder.Const(negOneConstName, model.Float32, []int64{}, []float32{-1.0})
+		operandDType := operandValue.DType()
+		if operandDType != model.Float32 {
+			negOne = f.builder.milBuilder.Cast(negOne, operandDType)
+		}
+		negInput := f.builder.milBuilder.Mul(operandValue, negOne)
 
 		// Step 2: Apply MaxPool to the negated input
 		maxPoolResult := f.builder.milBuilder.MaxPool(
@@ -2724,6 +2891,25 @@ func (f *Function) ReduceWindow(
 
 	default:
 		return nil, errors.Errorf("ReduceWindow: unsupported reduction type %v", reductionType)
+	}
+
+	// If we added fake dimensions, squeeze them out
+	if dimsToSqueeze > 0 {
+		// Build the output shape with only the original dimensions
+		outDims := make([]int64, outputShape.Rank())
+		for i := 0; i < outputShape.Rank(); i++ {
+			outDims[i] = int64(outputShape.Dimensions[i])
+		}
+		resultValue = f.builder.milBuilder.Reshape(resultValue, outDims)
+	}
+
+	// If we cast to Float32 for pooling, cast back to original dtype
+	if needsCastBack {
+		milDType, err := gomlxDTypeToMIL(operandDType)
+		if err != nil {
+			return nil, errors.Wrapf(err, "ReduceWindow: failed to convert dtype %s back after pooling", operandDType)
+		}
+		resultValue = f.builder.milBuilder.Cast(resultValue, milDType)
 	}
 
 	// Create a new node with the result
@@ -2767,10 +2953,17 @@ func (f *Function) Identity(x backends.Value) (backends.Value, error) {
 	return node, nil
 }
 
-// BroadcastInDim broadcasts x to an output with the given shape.
-// broadcastAxes has an output axes value for each x axes (len(broadcastAxes) == x.Shape.Rank()).
-// The i-th axis of x is mapped to the broadcastAxes[i]-th dimension of the output.
-func (f *Function) BroadcastInDim(x backends.Value, outputShape shapes.Shape, broadcastAxes []int) (backends.Value, error) {
+// BroadcastInDim broadcasts the input tensor to the target shape.
+//
+// The broadcastDims parameter specifies which dimensions of the output shape
+// correspond to dimensions of the input. For example:
+//   - Input shape: [3], Output shape: [2, 3], broadcastDims: [1]
+//     means input dim 0 maps to output dim 1, resulting in shape [2, 3]
+//   - Input shape: [2, 3], Output shape: [2, 3, 4], broadcastDims: [0, 1]
+//     means input dims map to output dims 0 and 1, resulting in shape [2, 3, 4]
+//
+// Implementation: First reshape to insert size-1 dimensions, then tile to expand.
+func (f *Function) BroadcastInDim(x backends.Value, shape shapes.Shape, broadcastDims []int) (backends.Value, error) {
 	opType := backends.OpTypeBroadcastInDim
 	inputs, err := f.builder.checkOps(opType.String(), x)
 	if err != nil {
@@ -2779,34 +2972,34 @@ func (f *Function) BroadcastInDim(x backends.Value, outputShape shapes.Shape, br
 	operand := inputs[0]
 
 	// Validate broadcast axes length
-	if len(broadcastAxes) != operand.shape.Rank() {
-		return nil, errors.Errorf("BroadcastInDim: broadcastAxes length (%d) must match input rank (%d)",
-			len(broadcastAxes), operand.shape.Rank())
+	if len(broadcastDims) != operand.shape.Rank() {
+		return nil, errors.Errorf("BroadcastInDim: broadcastDims length (%d) must match input rank (%d)",
+			len(broadcastDims), operand.shape.Rank())
 	}
 
 	// Validate broadcast axes bounds and dimension compatibility
-	for i, outAxis := range broadcastAxes {
-		if outAxis < 0 || outAxis >= outputShape.Rank() {
-			return nil, errors.Errorf("BroadcastInDim: broadcastAxes[%d]=%d out of bounds [0, %d)",
-				i, outAxis, outputShape.Rank())
+	for i, outAxis := range broadcastDims {
+		if outAxis < 0 || outAxis >= shape.Rank() {
+			return nil, errors.Errorf("BroadcastInDim: broadcastDims[%d]=%d out of bounds [0, %d)",
+				i, outAxis, shape.Rank())
 		}
 		inputDim := operand.shape.Dimensions[i]
-		outputDim := outputShape.Dimensions[outAxis]
+		outputDim := shape.Dimensions[outAxis]
 		if inputDim != outputDim && inputDim != 1 {
-			return nil, errors.Errorf("BroadcastInDim: dimension mismatch at broadcastAxes[%d]=%d: input dim=%d, output dim=%d (must be equal or input=1)",
+			return nil, errors.Errorf("BroadcastInDim: dimension mismatch at broadcastDims[%d]=%d: input dim=%d, output dim=%d (must be equal or input=1)",
 				i, outAxis, inputDim, outputDim)
 		}
 	}
 
 	// Convert output shape dimensions to int64
-	milOutShape := make([]int64, outputShape.Rank())
-	for i := 0; i < outputShape.Rank(); i++ {
-		milOutShape[i] = int64(outputShape.Dimensions[i])
+	milOutShape := make([]int64, shape.Rank())
+	for i := 0; i < shape.Rank(); i++ {
+		milOutShape[i] = int64(shape.Dimensions[i])
 	}
 
 	var resultValue *model.Value
 	if f.isClosureContext() {
-		resultValue, err = f.closurePlaceholder(outputShape)
+		resultValue, err = f.closurePlaceholder(shape)
 		if err != nil {
 			return nil, errors.Wrap(err, "BroadcastInDim")
 		}
@@ -2820,13 +3013,13 @@ func (f *Function) BroadcastInDim(x backends.Value, outputShape shapes.Shape, br
 
 		// Step 1: Build the intermediate shape after expanding dimensions
 		// The intermediate shape has the same rank as output, with:
-		// - Dimensions from input placed at positions specified by broadcastAxes
+		// - Dimensions from input placed at positions specified by broadcastDims
 		// - Size 1 at all other positions
-		intermediateShape := make([]int64, outputShape.Rank())
+		intermediateShape := make([]int64, shape.Rank())
 		for i := range intermediateShape {
 			intermediateShape[i] = 1
 		}
-		for i, outAxis := range broadcastAxes {
+		for i, outAxis := range broadcastDims {
 			intermediateShape[outAxis] = int64(operand.shape.Dimensions[i])
 		}
 
@@ -2834,8 +3027,8 @@ func (f *Function) BroadcastInDim(x backends.Value, outputShape shapes.Shape, br
 		reshaped := f.builder.milBuilder.Reshape(operand.milValue, intermediateShape)
 
 		// Step 2: Compute tile repetitions
-		reps := make([]int64, outputShape.Rank())
-		for i := 0; i < outputShape.Rank(); i++ {
+		reps := make([]int64, shape.Rank())
+		for i := 0; i < shape.Rank(); i++ {
 			if intermediateShape[i] == 1 {
 				reps[i] = milOutShape[i]
 			} else {
@@ -2860,7 +3053,7 @@ func (f *Function) BroadcastInDim(x backends.Value, outputShape shapes.Shape, br
 	}
 
 	// Create a new node with the result
-	node := f.builder.newNode(opType, outputShape, resultValue, operand)
+	node := f.builder.newNode(opType, shape, resultValue, operand)
 
 	return node, nil
 }

@@ -92,9 +92,15 @@ type FeatureSpec struct {
 
 // featureSpecToType converts a FeatureSpec to a FeatureType.
 func featureSpecToType(fs FeatureSpec) *spec.FeatureType {
-	// Convert shape to int32
-	shape := make([]int64, len(fs.Shape))
-	copy(shape, fs.Shape)
+	// Handle scalar (rank 0) tensors by representing them as shape [1]
+	// CoreML ArrayFeatureType requires at least one dimension for shape constraints
+	var shape []int64
+	if len(fs.Shape) == 0 {
+		shape = []int64{1}
+	} else {
+		shape = make([]int64, len(fs.Shape))
+		copy(shape, fs.Shape)
+	}
 
 	// Map dtype to ArrayFeatureType_ArrayDataType
 	var arrayDType spec.ArrayFeatureType_ArrayDataType

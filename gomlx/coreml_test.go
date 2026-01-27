@@ -890,6 +890,129 @@ func TestReshapeFlatten(t *testing.T) {
 	}
 }
 
+// TestBroadcastInDim tests the BroadcastInDim operation.
+func TestBroadcastInDim(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	tests := []struct {
+		name          string
+		inputShape    shapes.Shape
+		outputShape   shapes.Shape
+		broadcastDims []int
+		inputData     []float32
+		expectedData  []float32
+	}{
+		{
+			name:          "1D to 2D (add leading dim)",
+			inputShape:    shapes.Make(dtypes.Float32, 3),
+			outputShape:   shapes.Make(dtypes.Float32, 2, 3),
+			broadcastDims: []int{1}, // input dim 0 -> output dim 1
+			inputData:     []float32{1, 2, 3},
+			expectedData:  []float32{1, 2, 3, 1, 2, 3}, // [2, 3] with rows repeated
+		},
+		{
+			name:          "1D to 2D (add trailing dim)",
+			inputShape:    shapes.Make(dtypes.Float32, 2),
+			outputShape:   shapes.Make(dtypes.Float32, 2, 3),
+			broadcastDims: []int{0}, // input dim 0 -> output dim 0
+			inputData:     []float32{1, 2},
+			expectedData:  []float32{1, 1, 1, 2, 2, 2}, // [2, 3] with columns repeated
+		},
+		{
+			name:          "2D to 3D (add leading dim)",
+			inputShape:    shapes.Make(dtypes.Float32, 2, 3),
+			outputShape:   shapes.Make(dtypes.Float32, 4, 2, 3),
+			broadcastDims: []int{1, 2}, // input dims [0, 1] -> output dims [1, 2]
+			inputData:     []float32{1, 2, 3, 4, 5, 6},
+			expectedData: []float32{
+				1, 2, 3, 4, 5, 6, // batch 0
+				1, 2, 3, 4, 5, 6, // batch 1
+				1, 2, 3, 4, 5, 6, // batch 2
+				1, 2, 3, 4, 5, 6, // batch 3
+			},
+		},
+		// Note: scalar inputs are not supported by CoreML (requires at least 1 dimension)
+		// {
+		// 	name:          "scalar to 1D",
+		// 	inputShape:    shapes.Make(dtypes.Float32), // scalar
+		// 	outputShape:   shapes.Make(dtypes.Float32, 5),
+		// 	broadcastDims: []int{}, // no dims to map
+		// 	inputData:     []float32{7},
+		// 	expectedData:  []float32{7, 7, 7, 7, 7},
+		// },
+		{
+			name:          "size-1 tensor to 1D",
+			inputShape:    shapes.Make(dtypes.Float32, 1), // size-1 tensor instead of scalar
+			outputShape:   shapes.Make(dtypes.Float32, 5),
+			broadcastDims: []int{0},
+			inputData:     []float32{7},
+			expectedData:  []float32{7, 7, 7, 7, 7},
+		},
+		{
+			name:          "no-op broadcast (same shape)",
+			inputShape:    shapes.Make(dtypes.Float32, 2, 3),
+			outputShape:   shapes.Make(dtypes.Float32, 2, 3),
+			broadcastDims: []int{0, 1},
+			inputData:     []float32{1, 2, 3, 4, 5, 6},
+			expectedData:  []float32{1, 2, 3, 4, 5, 6},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			builder := backend.Builder("test_broadcast_" + tt.name)
+			mainFn := builder.Main()
+
+			x, err := mainFn.Parameter("x", tt.inputShape, nil)
+			if err != nil {
+				t.Fatalf("Parameter() failed: %v", err)
+			}
+
+			result, err := mainFn.BroadcastInDim(x, tt.outputShape, tt.broadcastDims)
+			if err != nil {
+				t.Fatalf("BroadcastInDim() failed: %v", err)
+			}
+
+			err = mainFn.Return([]backends.Value{result}, nil)
+			if err != nil {
+				t.Fatalf("Return() failed: %v", err)
+			}
+
+			exec, err := builder.Compile()
+			if err != nil {
+				t.Fatalf("Compile() failed: %v", err)
+			}
+			defer exec.Finalize()
+
+			inputBuffer, err := backend.BufferFromFlatData(0, tt.inputData, tt.inputShape)
+			if err != nil {
+				t.Fatalf("BufferFromFlatData() failed: %v", err)
+			}
+
+			outputs, err := exec.Execute([]backends.Buffer{inputBuffer}, nil, 0)
+			if err != nil {
+				t.Fatalf("Execute() failed: %v", err)
+			}
+
+			outputData := make([]float32, tt.outputShape.Size())
+			err = backend.BufferToFlatData(outputs[0], outputData)
+			if err != nil {
+				t.Fatalf("BufferToFlatData() failed: %v", err)
+			}
+
+			for i := range tt.expectedData {
+				if math.Abs(float64(outputData[i]-tt.expectedData[i])) > 1e-5 {
+					t.Errorf("outputData[%d] = %f, want %f", i, outputData[i], tt.expectedData[i])
+				}
+			}
+		})
+	}
+}
+
 // TestTranspose tests the Transpose operation.
 func TestTranspose(t *testing.T) {
 	backend, err := New("")
@@ -1774,4 +1897,93 @@ func TestWhileValidation(t *testing.T) {
 			t.Error("While() should fail when body outputs don't match initial state count")
 		}
 	})
+}
+
+// TestInt64ConstantConvertedToInt32InMIL verifies that int64 constants are kept
+// as Int64 at the GoMLX level but converted to Int32 at the MIL level for CoreML
+// compatibility. This allows onnx-gomlx to see consistent Int64 types while
+// CoreML gets Int32 (which it supports).
+func TestInt64ConstantConvertedToInt32InMIL(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("test_int64_to_int32")
+	mainFn := builder.Main()
+
+	// Create an int64 constant with values that fit in int32.
+	// This simulates what happens when loading ONNX models that use int64 for axes.
+	int64Data := []int64{1, 2, 3, 4, 5}
+	constant, err := mainFn.Constant(int64Data, 5)
+	if err != nil {
+		t.Fatalf("Constant([]int64) failed: %v", err)
+	}
+
+	// The GoMLX shape should remain Int64 (for onnx-gomlx compatibility)
+	constNode := constant.(*Node)
+	if constNode.shape.DType != dtypes.Int64 {
+		t.Errorf("Expected GoMLX dtype to remain Int64, got %v", constNode.shape.DType)
+	}
+
+	// Convert to float32 for output verification
+	floatOut, err := mainFn.ConvertDType(constant, dtypes.Float32)
+	if err != nil {
+		t.Fatalf("ConvertDType() failed: %v", err)
+	}
+
+	err = mainFn.Return([]backends.Value{floatOut}, nil)
+	if err != nil {
+		t.Fatalf("Return() failed: %v", err)
+	}
+
+	// Compile and execute - this should work because MIL uses Int32
+	exec, err := builder.Compile()
+	if err != nil {
+		t.Fatalf("Compile() failed: %v", err)
+	}
+	defer exec.Finalize()
+
+	outputs, err := exec.Execute(nil, nil, 0)
+	if err != nil {
+		t.Fatalf("Execute() failed: %v", err)
+	}
+
+	// Verify output values
+	outputData := make([]float32, 5)
+	err = backend.BufferToFlatData(outputs[0], outputData)
+	if err != nil {
+		t.Fatalf("BufferToFlatData() failed: %v", err)
+	}
+
+	expected := []float32{1, 2, 3, 4, 5}
+	for i := range expected {
+		if outputData[i] != expected[i] {
+			t.Errorf("outputData[%d] = %f, want %f", i, outputData[i], expected[i])
+		}
+	}
+}
+
+// TestInt64ConstantLargeValuesError verifies that int64 constants with
+// values outside int32 range return an error (since CoreML requires Int32).
+func TestInt64ConstantLargeValuesError(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("test_int64_large_error")
+	mainFn := builder.Main()
+
+	// Create an int64 constant with a value outside int32 range
+	largeValue := int64(3_000_000_000) // > MaxInt32 (2,147,483,647)
+	int64Data := []int64{largeValue}
+	_, err = mainFn.Constant(int64Data, 1)
+
+	// Should fail because the value doesn't fit in Int32
+	if err == nil {
+		t.Error("Expected error for Int64 constant with value exceeding Int32 range")
+	}
 }

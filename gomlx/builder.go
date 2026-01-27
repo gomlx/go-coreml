@@ -6,6 +6,7 @@ package coreml
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 
 	"github.com/gomlx/go-coreml/model"
@@ -201,7 +202,32 @@ func checkFlat(flat any) (dtype dtypes.DType, flatLen int, err error) {
 	return dtype, flatLen, nil
 }
 
+// int64SliceFitsInInt32 checks if all values in an int64 slice fit within int32 range.
+// This is used to downcast int64 constants to int32 for CoreML compatibility,
+// since CoreML doesn't support int64 for many operations (e.g., identity, axes parameters).
+func int64SliceFitsInInt32(data []int64) bool {
+	for _, v := range data {
+		if v < math.MinInt32 || v > math.MaxInt32 {
+			return false
+		}
+	}
+	return true
+}
+
+// convertInt64ToInt32 converts an int64 slice to int32 slice.
+// Caller must ensure all values fit in int32 range (use int64SliceFitsInInt32 first).
+func convertInt64ToInt32(data []int64) []int32 {
+	result := make([]int32, len(data))
+	for i, v := range data {
+		result[i] = int32(v)
+	}
+	return result
+}
+
 // gomlxDTypeToMIL converts a GoMLX DType to a CoreML MIL DType.
+// Note: Int64 is mapped to Int32 because CoreML doesn't support Int64 for many
+// operations (e.g., identity op). ONNX models commonly use Int64 for indices/axes
+// which always fit in Int32.
 func gomlxDTypeToMIL(dtype dtypes.DType) (model.DType, error) {
 	switch dtype {
 	case dtypes.Float16:
@@ -217,7 +243,9 @@ func gomlxDTypeToMIL(dtype dtypes.DType) (model.DType, error) {
 	case dtypes.Int32:
 		return model.Int32, nil
 	case dtypes.Int64:
-		return model.Int64, nil
+		// CoreML doesn't support Int64 for many operations (identity, etc.)
+		// Map to Int32 - indices/axes in ML models always fit in Int32
+		return model.Int32, nil
 	case dtypes.Bool:
 		return model.Bool, nil
 	default:

@@ -238,25 +238,32 @@ func (e *Executable) Close() error {
 
 // createTensor creates a bridge.Tensor from Go data.
 func createTensor(shape []int64, data interface{}) (*bridge.Tensor, error) {
+	// Handle scalar tensors: CoreML requires shape [1] for scalars
+	// This matches the handling in serialize.go featureSpecToType
+	actualShape := shape
+	if len(shape) == 0 {
+		actualShape = []int64{1}
+	}
+
 	switch d := data.(type) {
 	case []float32:
-		return bridge.NewTensorWithData(shape, bridge.DTypeFloat32, unsafe.Pointer(&d[0]))
+		return bridge.NewTensorWithData(actualShape, bridge.DTypeFloat32, unsafe.Pointer(&d[0]))
 	case []float64:
 		// Convert to float32
 		f32 := make([]float32, len(d))
 		for i, v := range d {
 			f32[i] = float32(v)
 		}
-		return bridge.NewTensorWithData(shape, bridge.DTypeFloat32, unsafe.Pointer(&f32[0]))
+		return bridge.NewTensorWithData(actualShape, bridge.DTypeFloat32, unsafe.Pointer(&f32[0]))
 	case []int32:
-		return bridge.NewTensorWithData(shape, bridge.DTypeInt32, unsafe.Pointer(&d[0]))
+		return bridge.NewTensorWithData(actualShape, bridge.DTypeInt32, unsafe.Pointer(&d[0]))
 	case []int64:
 		// Convert to int32
 		i32 := make([]int32, len(d))
 		for i, v := range d {
 			i32[i] = int32(v)
 		}
-		return bridge.NewTensorWithData(shape, bridge.DTypeInt32, unsafe.Pointer(&i32[0]))
+		return bridge.NewTensorWithData(actualShape, bridge.DTypeInt32, unsafe.Pointer(&i32[0]))
 	default:
 		return nil, fmt.Errorf("unsupported data type: %T", data)
 	}

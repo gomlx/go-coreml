@@ -999,3 +999,216 @@ func TestConvGeneralKernelDilationWorks(t *testing.T) {
 	}
 	t.Logf("Kernel dilation works correctly, output: %v", outputData)
 }
+
+// TestReduceWindowRank2 tests ReduceWindow on rank 2 tensors (e.g., for sequence pooling)
+func TestReduceWindowRank2(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("test_reduce_window_rank2")
+	main := builder.Main()
+
+	// Create a 2D input [batch=2, seq=4]
+	inputShape := shapes.Make(dtypes.Float32, 2, 4)
+	input, err := main.Parameter("input", inputShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter failed: %v", err)
+	}
+
+	// Mean pool over the sequence dimension (axis 1)
+	// window = [1, 4] means no reduction on batch, full reduction on seq
+	// strides = [1, 4] means same as window (non-overlapping)
+	output, err := main.ReduceWindow(
+		input,
+		backends.ReduceOpSum, // Sum pooling
+		[]int{1, 4},          // window dimensions
+		[]int{1, 4},          // strides
+		nil,                  // base dilations
+		nil,                  // window dilations
+		nil,                  // paddings
+	)
+	if err != nil {
+		t.Fatalf("ReduceWindow failed: %v", err)
+	}
+
+	err = main.Return([]backends.Value{output}, nil)
+	if err != nil {
+		t.Fatalf("Return failed: %v", err)
+	}
+
+	exec, err := builder.Compile()
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+	defer exec.Finalize()
+
+	// Create input data: [[1,2,3,4], [5,6,7,8]]
+	inputData := []float32{1, 2, 3, 4, 5, 6, 7, 8}
+	inputBuf, err := backend.BufferFromFlatData(0, inputData, inputShape)
+	if err != nil {
+		t.Fatalf("BufferFromFlatData failed: %v", err)
+	}
+
+	outputs, err := exec.Execute([]backends.Buffer{inputBuf}, nil, 0)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	if len(outputs) != 1 {
+		t.Fatalf("Expected 1 output, got %d", len(outputs))
+	}
+
+	// Output should be [batch=2, 1] with sums [10, 26]
+	outputShape, _ := backend.BufferShape(outputs[0])
+	t.Logf("Output shape: %v", outputShape)
+
+	result := make([]float32, outputShape.Size())
+	err = backend.BufferToFlatData(outputs[0], result)
+	if err != nil {
+		t.Fatalf("BufferToFlatData failed: %v", err)
+	}
+
+	t.Logf("ReduceWindow rank 2 result: %v", result)
+
+	// Expected: sum([1,2,3,4]) = 10, sum([5,6,7,8]) = 26
+	expected := []float32{10, 26}
+	if len(result) != len(expected) {
+		t.Errorf("Expected %d elements, got %d", len(expected), len(result))
+	}
+	for i := range expected {
+		if i < len(result) && (result[i]-expected[i] > 0.01 || result[i]-expected[i] < -0.01) {
+			t.Errorf("Element %d: expected %f, got %f", i, expected[i], result[i])
+		}
+	}
+}
+
+// TestReduceWindowFloat16 tests ReduceWindow with Float16 tensors (common in embedding models)
+func TestReduceWindowFloat16(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("test_reduce_window_fp16")
+	main := builder.Main()
+
+	// Create a Float16 4D input [batch=1, channels=2, height=4, width=4] (NCHW format)
+	// CoreML pooling requires NCHW layout with pooling on spatial dimensions only
+	inputShape := shapes.Make(dtypes.Float16, 1, 2, 4, 4)
+	input, err := main.Parameter("input", inputShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter failed: %v", err)
+	}
+
+	// Pool over the spatial dimensions (H, W) with 2x2 window
+	// window = [1, 1, 2, 2] means batch/channel stay, spatial pooled with 2x2
+	output, err := main.ReduceWindow(
+		input,
+		backends.ReduceOpSum,
+		[]int{1, 1, 2, 2}, // window dimensions: [N, C, H, W]
+		[]int{1, 1, 2, 2}, // strides
+		nil,               // base dilations
+		nil,               // window dilations
+		nil,               // paddings
+	)
+	if err != nil {
+		t.Fatalf("ReduceWindow failed: %v", err)
+	}
+
+	err = main.Return([]backends.Value{output}, nil)
+	if err != nil {
+		t.Fatalf("Return failed: %v", err)
+	}
+
+	exec, err := builder.Compile()
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+	defer exec.Finalize()
+
+	t.Log("Float16 ReduceWindow compilation succeeded")
+}
+
+// TestReduceWindowInt32 tests ReduceWindow with Int32 tensors (auto-cast to Float32)
+func TestReduceWindowInt32(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("test_reduce_window_int32")
+	main := builder.Main()
+
+	// Create an Int32 4D input [batch=1, channels=1, height=4, width=4] (NCHW format)
+	inputShape := shapes.Make(dtypes.Int32, 1, 1, 4, 4)
+	input, err := main.Parameter("input", inputShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter failed: %v", err)
+	}
+
+	// Max pool over spatial dimensions with 2x2 window
+	output, err := main.ReduceWindow(
+		input,
+		backends.ReduceOpMax,
+		[]int{1, 1, 2, 2}, // window dimensions
+		[]int{1, 1, 2, 2}, // strides
+		nil,               // base dilations
+		nil,               // window dilations
+		nil,               // paddings
+	)
+	if err != nil {
+		t.Fatalf("ReduceWindow failed: %v", err)
+	}
+
+	err = main.Return([]backends.Value{output}, nil)
+	if err != nil {
+		t.Fatalf("Return failed: %v", err)
+	}
+
+	exec, err := builder.Compile()
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+	defer exec.Finalize()
+
+	// Execute with test data
+	inputData := make([]int32, 16)
+	for i := range inputData {
+		inputData[i] = int32(i + 1)
+	}
+	inputBuf, err := backend.BufferFromFlatData(0, inputData, inputShape)
+	if err != nil {
+		t.Fatalf("BufferFromFlatData failed: %v", err)
+	}
+
+	outputs, err := exec.Execute([]backends.Buffer{inputBuf}, nil, 0)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	outputShape, _ := backend.BufferShape(outputs[0])
+	t.Logf("Output shape: %v", outputShape)
+
+	result := make([]int32, outputShape.Size())
+	err = backend.BufferToFlatData(outputs[0], result)
+	if err != nil {
+		t.Fatalf("BufferToFlatData failed: %v", err)
+	}
+
+	t.Logf("Int32 ReduceWindow result: %v", result)
+
+	// Expected: max of 2x2 windows
+	// [[1,2,3,4],[5,6,7,8],[9,10,11,12],[13,14,15,16]] with 2x2 max pool
+	// => [[6, 8], [14, 16]]
+	expected := []int32{6, 8, 14, 16}
+	for i, exp := range expected {
+		if i < len(result) && result[i] != exp {
+			t.Errorf("Element %d: expected %d, got %d", i, exp, result[i])
+		}
+	}
+}

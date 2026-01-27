@@ -3,6 +3,7 @@
 package coreml
 
 import (
+	"math"
 	"reflect"
 	"strings"
 	"sync"
@@ -12,6 +13,15 @@ import (
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/pkg/errors"
 )
+
+// internalDType returns the dtype used internally for storage.
+// Int64 is stored as Int32 because CoreML doesn't support Int64 well.
+func internalDType(dtype dtypes.DType) dtypes.DType {
+	if dtype == dtypes.Int64 {
+		return dtypes.Int32
+	}
+	return dtype
+}
 
 // Compile-time check:
 var _ backends.DataInterface = (*Backend)(nil)
@@ -51,13 +61,16 @@ func (b *Backend) getBufferPool(dtype dtypes.DType, length int) *sync.Pool {
 
 // getBuffer from the backend pool of buffers.
 // Important: it's not necessarily initialized with zero, since it can reuse old buffers.
+// Note: Uses internal dtype (Int64→Int32) for actual storage.
 //
 // See also Buffer.Zeros to initialize it with zeros, if needed.
 func (b *Backend) getBuffer(dtype dtypes.DType, length int) *Buffer {
 	if b.isFinalized {
 		return nil
 	}
-	pool := b.getBufferPool(dtype, length)
+	// Use internal dtype for storage (Int64→Int32)
+	storageDType := internalDType(dtype)
+	pool := b.getBufferPool(storageDType, length)
 	buf := pool.Get().(*Buffer)
 	buf.valid = true
 	return buf
@@ -183,18 +196,42 @@ func (b *Backend) BufferDeviceNum(buffer backends.Buffer) (backends.DeviceNum, e
 // BufferToFlatData transfers the flat values of the buffer to the Go flat array.
 // The slice flat must have the exact number of elements required to store the backends.Buffer shape.
 //
+// Note: If the shape is Int64, the buffer internally stores Int32 (CoreML limitation).
+// This function handles the conversion back to Int64 when needed.
+//
 // See also BufferFromFlatData, BufferShape, and shapes.Shape.Size.
 func (b *Backend) BufferToFlatData(backendBuffer backends.Buffer, flat any) error {
 	buf, ok := backendBuffer.(*Buffer)
 	if !ok {
 		return errors.Errorf("buffer is not a %q backend buffer", BackendName)
 	}
+
+	// Handle Int64 shape with Int32 storage
+	if buf.shape.DType == dtypes.Int64 {
+		// Buffer stores Int32 internally, but caller expects Int64
+		int32Data, ok := buf.flat.([]int32)
+		if !ok {
+			return errors.Errorf("buffer has Int64 shape but internal storage is not []int32")
+		}
+		int64Data, ok := flat.([]int64)
+		if !ok {
+			return errors.Errorf("flat slice must be []int64 for Int64 shape, got %T", flat)
+		}
+		for i, v := range int32Data {
+			int64Data[i] = int64(v)
+		}
+		return nil
+	}
+
 	copyFlat(flat, buf.flat)
 	return nil
 }
 
 // BufferFromFlatData transfers data from Go given as a flat slice (of the type corresponding to the shape DType)
 // to the deviceNum, and returns the corresponding backends.Buffer.
+//
+// Note: If the shape is Int64, the buffer will internally store as Int32 (CoreML limitation).
+// This function handles the conversion from Int64 to Int32.
 func (b *Backend) BufferFromFlatData(deviceNum backends.DeviceNum, flat any, shape shapes.Shape) (backends.Buffer, error) {
 	if b.isFinalized {
 		return nil, errors.Errorf("backend is already finalized")
@@ -208,6 +245,26 @@ func (b *Backend) BufferFromFlatData(deviceNum backends.DeviceNum, flat any, sha
 			reflect.TypeOf(flat).Elem(), shape.DType)
 	}
 	buffer := b.NewBuffer(shape)
+
+	// Handle Int64 shape: convert to Int32 for storage
+	if shape.DType == dtypes.Int64 {
+		int64Data, ok := flat.([]int64)
+		if !ok {
+			return nil, errors.Errorf("flat slice must be []int64 for Int64 shape, got %T", flat)
+		}
+		int32Data, ok := buffer.flat.([]int32)
+		if !ok {
+			return nil, errors.Errorf("buffer storage should be []int32 for Int64 shape")
+		}
+		for i, v := range int64Data {
+			if v < math.MinInt32 || v > math.MaxInt32 {
+				return nil, errors.Errorf("Int64 value %d at index %d exceeds Int32 range", v, i)
+			}
+			int32Data[i] = int32(v)
+		}
+		return buffer, nil
+	}
+
 	copyFlat(buffer.flat, flat)
 	return buffer, nil
 }
@@ -233,6 +290,11 @@ func (b *Backend) HasSharedBuffers() bool {
 //
 // It returns a handle to the buffer and a slice of the corresponding data type pointing
 // to the shared data.
+//
+// Note: For Int64 shapes, the buffer internally stores Int32 (CoreML limitation).
+// The returned flat slice will be []int64 (allocated and converted), but mutations to it
+// will NOT be reflected in the buffer. Use BufferFromFlatData to update the buffer with
+// []int64 data.
 func (b *Backend) NewSharedBuffer(deviceNum backends.DeviceNum, shape shapes.Shape) (buffer backends.Buffer, flat any, err error) {
 	if b.isFinalized {
 		return nil, nil, errors.Errorf("backend is already finalized")
@@ -242,6 +304,23 @@ func (b *Backend) NewSharedBuffer(deviceNum backends.DeviceNum, shape shapes.Sha
 			b.Name(), deviceNum, shape)
 	}
 	goBuffer := b.NewBuffer(shape)
+
+	// Handle Int64 shape with Int32 storage
+	// We return a []int64 slice to match what the caller expects, but it's not truly shared
+	// since we need to convert between Int32 and Int64
+	if shape.DType == dtypes.Int64 {
+		int32Data, ok := goBuffer.flat.([]int32)
+		if !ok {
+			return nil, nil, errors.Errorf("buffer has Int64 shape but internal storage is not []int32")
+		}
+		// Allocate and convert to []int64
+		int64Data := make([]int64, len(int32Data))
+		for i, v := range int32Data {
+			int64Data[i] = int64(v)
+		}
+		return goBuffer, int64Data, nil
+	}
+
 	return goBuffer, goBuffer.flat, nil
 }
 
@@ -251,6 +330,11 @@ func (b *Backend) NewSharedBuffer(deviceNum backends.DeviceNum, shape shapes.Sha
 // shares CPU memory.
 //
 // The returned slice becomes invalid after the buffer is destroyed.
+//
+// Note: For Int64 shapes, the buffer internally stores Int32 (CoreML limitation).
+// This function will allocate and return a converted []int64 slice to match the
+// expected dtype. For truly zero-copy access to Int64 shapes, you would need to
+// work with the underlying []int32 storage directly.
 func (b *Backend) BufferData(buffer backends.Buffer) (flat any, err error) {
 	if b.isFinalized {
 		return nil, errors.Errorf("backend is already finalized")
@@ -259,6 +343,22 @@ func (b *Backend) BufferData(buffer backends.Buffer) (flat any, err error) {
 	if !ok {
 		return nil, errors.Errorf("buffer is not a %q backend buffer", BackendName)
 	}
+
+	// Handle Int64 shape with Int32 storage
+	// We need to return []int64 to match what the caller expects based on shape.DType
+	if buf.shape.DType == dtypes.Int64 {
+		int32Data, ok := buf.flat.([]int32)
+		if !ok {
+			return nil, errors.Errorf("buffer has Int64 shape but internal storage is not []int32")
+		}
+		// Allocate and convert to []int64
+		int64Data := make([]int64, len(int32Data))
+		for i, v := range int32Data {
+			int64Data[i] = int64(v)
+		}
+		return int64Data, nil
+	}
+
 	return buf.flat, nil
 }
 
