@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"sync"
 
-	"github.com/gomlx/go-coreml/runtime"
+	"github.com/gomlx/go-darwinml/coreml/runtime"
 	"github.com/gomlx/gomlx/backends"
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/pkg/errors"

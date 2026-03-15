@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/gomlx/go-coreml/blob"
+	"github.com/gomlx/go-darwinml/blob"
 )
 
 func TestSaveMLPackageWithBlobs(t *testing.T) {

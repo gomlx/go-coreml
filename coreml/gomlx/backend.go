@@ -11,8 +11,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/gomlx/go-coreml/model"
-	"github.com/gomlx/go-coreml/runtime"
+	"github.com/gomlx/go-darwinml/coreml/model"
+	"github.com/gomlx/go-darwinml/coreml/runtime"
 	"github.com/gomlx/gomlx/backends"
 	"github.com/pkg/errors"
 )

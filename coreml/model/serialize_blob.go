@@ -9,9 +9,9 @@ import (
 	"path/filepath"
 
 	"github.com/google/uuid"
-	"github.com/gomlx/go-coreml/blob"
-	"github.com/gomlx/go-coreml/proto/coreml/milspec"
-	"github.com/gomlx/go-coreml/proto/coreml/spec"
+	"github.com/gomlx/go-darwinml/blob"
+	"github.com/gomlx/go-darwinml/proto/coreml/milspec"
+	"github.com/gomlx/go-darwinml/proto/coreml/spec"
 	"google.golang.org/protobuf/proto"
 )
 

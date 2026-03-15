@@ -3,7 +3,7 @@ package model_test
 import (
 	"fmt"
 
-	"github.com/gomlx/go-coreml/model"
+	"github.com/gomlx/go-darwinml/coreml/model"
 )
 
 // ExampleBuilder_Concat demonstrates concatenating multiple tensors along an axis.

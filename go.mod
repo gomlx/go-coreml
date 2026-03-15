@@ -1,4 +1,4 @@
-module github.com/gomlx/go-coreml
+module github.com/gomlx/go-darwinml
 
 go 1.25.5
 

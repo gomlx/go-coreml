@@ -9,7 +9,7 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/gomlx/go-coreml/mpsgraph/gomlx/internal/bridge"
+	"github.com/gomlx/go-darwinml/mpsgraph/gomlx/internal/bridge"
 	"github.com/gomlx/gomlx/backends"
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/pkg/errors"

@@ -17,7 +17,7 @@ package model
 import (
 	"fmt"
 
-	"github.com/gomlx/go-coreml/proto/coreml/milspec"
+	"github.com/gomlx/go-darwinml/proto/coreml/milspec"
 )
 
 // DType represents a data type for tensors.

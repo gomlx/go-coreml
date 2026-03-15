@@ -3,7 +3,7 @@ package model_test
 import (
 	"fmt"
 
-	"github.com/gomlx/go-coreml/model"
+	"github.com/gomlx/go-darwinml/coreml/model"
 )
 
 // ExampleBuilder_Einsum demonstrates how to use the Einsum operation for

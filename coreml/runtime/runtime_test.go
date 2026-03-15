@@ -3,8 +3,8 @@ package runtime
 import (
 	"testing"
 
-	"github.com/gomlx/go-coreml/internal/bridge"
-	"github.com/gomlx/go-coreml/model"
+	"github.com/gomlx/go-darwinml/coreml/internal/bridge"
+	"github.com/gomlx/go-darwinml/coreml/model"
 )
 
 // skipIfNotMacOS skips the test if not running on macOS.

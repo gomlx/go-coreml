@@ -27,8 +27,8 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/gomlx/go-coreml/internal/bridge"
-	"github.com/gomlx/go-coreml/model"
+	"github.com/gomlx/go-darwinml/coreml/internal/bridge"
+	"github.com/gomlx/go-darwinml/coreml/model"
 )
 
 // Runtime manages CoreML model compilation and execution.

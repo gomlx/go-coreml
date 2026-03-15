@@ -3,7 +3,7 @@ package model
 import (
 	"testing"
 
-	"github.com/gomlx/go-coreml/proto/coreml/milspec"
+	"github.com/gomlx/go-darwinml/proto/coreml/milspec"
 )
 
 func TestBlockBuilder_BasicOps(t *testing.T) {

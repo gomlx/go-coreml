@@ -2974,7 +2974,7 @@ func TestFusedScaledDotProductAttention(t *testing.T) {
 
 		result := graph.MustExecOnce(backend, func(q, k, v *graph.Node) *graph.Node {
 			return graph.BackendFusedScaledDotProductAttention(
-				q, k, v, nil, 1, 1, backends.AxesLayoutBHSD, scale, false)
+				q, k, v, nil, 1, 1, backends.AxesLayoutBHSD, scale, false, nil)
 		},
 			tensors.FromFlatDataAndDimensions(data, 1, 1, 2, 2),
 			tensors.FromFlatDataAndDimensions(data, 1, 1, 2, 2),
@@ -3003,7 +3003,7 @@ func TestFusedScaledDotProductAttention(t *testing.T) {
 
 		result := graph.MustExecOnce(backend, func(q, k, v *graph.Node) *graph.Node {
 			return graph.BackendFusedScaledDotProductAttention(
-				q, k, v, nil, 1, 1, backends.AxesLayoutBHSD, scale, true)
+				q, k, v, nil, 1, 1, backends.AxesLayoutBHSD, scale, true, nil)
 		},
 			tensors.FromFlatDataAndDimensions(qData, 1, 1, 3, 2),
 			tensors.FromFlatDataAndDimensions(kData, 1, 1, 3, 2),
@@ -3021,7 +3021,7 @@ func TestFusedScaledDotProductAttention(t *testing.T) {
 
 		result := graph.MustExecOnce(backend, func(q, k, v *graph.Node) *graph.Node {
 			return graph.BackendFusedScaledDotProductAttention(
-				q, k, v, nil, 1, 1, backends.AxesLayoutBSHD, scale, false)
+				q, k, v, nil, 1, 1, backends.AxesLayoutBSHD, scale, false, nil)
 		},
 			tensors.FromFlatDataAndDimensions(data, 1, 2, 1, 2),
 			tensors.FromFlatDataAndDimensions(data, 1, 2, 1, 2),
@@ -3044,7 +3044,7 @@ func TestFusedScaledDotProductAttention(t *testing.T) {
 
 		result := graph.MustExecOnce(backend, func(q, k, v, m *graph.Node) *graph.Node {
 			return graph.BackendFusedScaledDotProductAttention(
-				q, k, v, m, 1, 1, backends.AxesLayoutBHSD, 1.0, false)
+				q, k, v, m, 1, 1, backends.AxesLayoutBHSD, 1.0, false, nil)
 		},
 			tensors.FromFlatDataAndDimensions(qData, 1, 1, 2, 2),
 			tensors.FromFlatDataAndDimensions(kData, 1, 1, 2, 2),

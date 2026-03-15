@@ -6,8 +6,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/gomlx/go-coreml/proto/coreml/milspec"
-	"github.com/gomlx/go-coreml/proto/coreml/spec"
+	"github.com/gomlx/go-darwinml/proto/coreml/milspec"
+	"github.com/gomlx/go-darwinml/proto/coreml/spec"
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 )

@@ -5,7 +5,7 @@ package coreml
 import (
 	"testing"
 
-	"github.com/gomlx/go-coreml/model"
+	"github.com/gomlx/go-darwinml/coreml/model"
 	"github.com/gomlx/gomlx/pkg/core/dtypes"
 	"github.com/gomlx/gomlx/pkg/core/graph"
 	"github.com/gomlx/gomlx/pkg/core/shapes"

@@ -3,7 +3,7 @@ package model
 import (
 	"fmt"
 
-	"github.com/gomlx/go-coreml/proto/coreml/milspec"
+	"github.com/gomlx/go-darwinml/proto/coreml/milspec"
 )
 
 // BlockBuilder builds a nested block within an operation.

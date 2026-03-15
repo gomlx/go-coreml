@@ -9,7 +9,7 @@ import (
 	"math"
 	"slices"
 
-	"github.com/gomlx/go-coreml/model"
+	"github.com/gomlx/go-darwinml/coreml/model"
 	"github.com/gomlx/gomlx/backends"
 	"github.com/gomlx/gomlx/backends/notimplemented"
 	"github.com/gomlx/gomlx/backends/shapeinference"

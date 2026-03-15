@@ -26,7 +26,7 @@
 
 syntax = "proto3";
 option optimize_for = LITE_RUNTIME;
-option go_package = "github.com/gomlx/go-coreml/proto/coreml/milspec";
+option go_package = "github.com/gomlx/go-darwinml/proto/coreml/milspec";
 
 package CoreML.Specification.MILSpec;
 

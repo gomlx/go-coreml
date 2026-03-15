@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/gomlx/go-coreml/blob"
-	"github.com/gomlx/go-coreml/model"
+	"github.com/gomlx/go-darwinml/blob"
+	"github.com/gomlx/go-darwinml/coreml/model"
 )
 
 func TestBlobStorageE2E(t *testing.T) {

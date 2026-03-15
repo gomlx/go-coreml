@@ -10,7 +10,7 @@ import (
 	"runtime"
 	"unsafe"
 
-	"github.com/gomlx/go-coreml/mpsgraph/gomlx/internal/bridge"
+	"github.com/gomlx/go-darwinml/mpsgraph/gomlx/internal/bridge"
 	"github.com/gomlx/gomlx/backends"
 	"github.com/gomlx/gomlx/backends/notimplemented"
 	"github.com/gomlx/gomlx/backends/shapeinference"
@@ -2672,6 +2672,7 @@ func (f *Function) FusedScaledDotProductAttention(
 	axesLayout backends.AxesLayout,
 	scale float64,
 	causal bool,
+	options *backends.ScaledDotProductAttentionConfig,
 ) (backends.Value, error) {
 	qNode, err := f.resolveNode(query)
 	if err != nil {

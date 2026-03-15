@@ -1,4 +1,4 @@
-module github.com/gomlx/go-coreml/mpsgraph/gomlx
+module github.com/gomlx/go-darwinml/mpsgraph/gomlx
 
 go 1.25
 

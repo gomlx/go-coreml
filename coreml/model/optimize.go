@@ -3,7 +3,7 @@ package model
 import (
 	"sort"
 
-	"github.com/gomlx/go-coreml/proto/coreml/milspec"
+	"github.com/gomlx/go-darwinml/proto/coreml/milspec"
 )
 
 // optimizeHighRankOps applies optimization passes to eliminate operations
